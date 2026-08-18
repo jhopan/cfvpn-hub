@@ -1,0 +1,80 @@
+﻿<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>Proxy - CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+<script>if(!localStorage.getItem("CFVPN-vpn-panel-session"))location.replace("landing.html");</script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html">CFVPN <span>Hub</span></a>
+    <nav>
+      <a class="nav-link" href="index.html">Dashboard</a>
+      <a class="nav-link" href="workers.html">Workers</a>
+      <a class="nav-link" href="generator.html">Generator</a>
+      <a class="nav-link active" href="proxy.html">Proxy</a>
+      <a class="nav-link" href="deploy.html">Deploy</a><a class="nav-link" href="admin.html" id="adminNav" hidden>User</a>
+    </nav>
+    <div class="profile"><span data-user-email></span><button class="logout" id="logoutButton" type="button">Logout</button></div>
+  </header>
+
+  <main>
+    <header class="page-header">
+      <div><h1>Proxy Pool</h1><p>Tambah dan kelola proxy. Proxy dicek otomatis oleh Cron.</p></div>
+      <div class="admin-toolbar" id="adminProxyToolbar" hidden>
+        <button class="button secondary" id="proxyRefreshBtn" type="button">↻ Refresh Cache</button>
+        <button class="button secondary" id="proxyForceCron" type="button">Force Cron</button>
+        <button class="button secondary" id="proxyDeleteDeadBtn" type="button" style="color:var(--red);border-color:var(--red)">Hapus Mati</button>
+      </div>
+    </header>
+
+    <div class="proxy-layout">
+      <section class="panel" aria-labelledby="add-proxy-title">
+        <div class="panel-title"><span class="step-number">01</span><div><h2 id="add-proxy-title">Tambah Proxy</h2><p>Proxy akan dicek sebelum disimpan. Hanya proxy aktif yang masuk.</p></div></div>
+        <form class="generator-form" id="dbProxyForm" novalidate>
+          <label class="field">
+            <span>IP / Host:Port (pisahkan koma atau newline)</span>
+            <textarea id="dbProxyInput" placeholder="104.17.2.1:443&#10;192.168.1.1:80&#10;proxy.contoh.com" rows="4"></textarea>
+          </label>
+          <p class="form-message" id="dbProxyMessage" aria-live="polite"></p>
+          <button class="button primary" id="addProxyBtn" type="submit">Cek & Tambah</button>
+        </form>
+      </section>
+
+      <section class="panel result-panel" aria-labelledby="proxy-list-title">
+        <div class="result-header">
+          <div class="panel-title"><span class="step-number">02</span><div><h2 id="proxy-list-title">Daftar Proxy</h2><p>Data dari database, di-cache 6 jam.</p></div></div>
+          <span class="badge" id="dbCount">0</span>
+        </div>
+
+        <div class="proxy-tabs">
+          <button class="button secondary proxy-tab active" id="tabLiveBtn" type="button">Aktif</button>
+          <button class="button secondary proxy-tab" id="tabDeadBtn" type="button">Mati</button>
+        </div>
+
+        <div class="proxy-table-wrap">
+          <table class="proxy-table" id="proxyTable">
+            <thead><tr><th>IP:Port</th><th>Negara</th><th>Penyedia</th><th>Status</th><th>Last Checked</th></tr></thead>
+            <tbody id="proxyTableBody"></tbody>
+          </table>
+          <div class="proxy-empty" id="proxyEmpty" hidden>Belum ada data.</div>
+        </div>
+
+        <div class="result-actions">
+          <button class="button secondary" id="copyDbProxyBtn" type="button">Copy IP</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer>CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  <script type="module" src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>

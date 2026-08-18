@@ -1,0 +1,6 @@
+﻿name = "proxy-cron-worker"
+main = "src/index.js"
+compatibility_date = "2024-03-01"
+
+[triggers]
+crons = ["*/15 * * * *"] # Cek setiap 15 menit

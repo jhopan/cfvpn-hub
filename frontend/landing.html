@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+</head>
+<body>
+  <div class="landing-shell">
+    <header class="public-topbar">
+      <a class="brand" href="landing.html">CFVPN <span>Hub</span></a>
+      <nav aria-label="Navigasi publik"><a href="login.html" class="button primary">Get Started</a></nav>
+    </header>
+    <main class="landing-hero">
+      <section>
+        <p class="eyebrow">Cloudflare VPN workspace</p>
+        <h1>Worker rapi.<br><span>Config siap pakai.</span></h1>
+        <p class="landing-lede">Kelola VPN Worker, Load Balancer, dan proxy pool dari satu panel. Buat config VLESS, Trojan, atau Shadowsocks langsung dari browser.</p>
+        <a href="login.html#register" class="button primary">Mulai buat config</a>
+      </section>
+      <aside class="landing-proof" aria-label="Kemampuan CFVPN Hub">
+        <div><strong>01 — Worker terpusat</strong><span>Tambah, aktifkan, dan pakai Worker dari satu daftar.</span></div>
+        <div><strong>02 — Output fleksibel</strong><span>Raw URI, V2Ray Base64, Clash YAML, atau Sing-box JSON.</span></div>
+        <div><strong>03 — Proxy pool</strong><span>Simpan proxy lalu filter proxy mati sebelum config dipakai.</span></div>
+      </aside>
+    </main>
+    <section class="landing-stats" id="landingStats">
+      <div class="landing-stat"><strong id="pubUsers">—</strong><span>Total User</span></div>
+      <div class="landing-stat"><strong id="pubWorkers">—</strong><span>Worker Deploy</span></div>
+      <div class="landing-stat"><strong id="pubProxies">—</strong><span>Proxy Aktif</span></div>
+      <div class="landing-stat"><strong id="pubConfigs">—</strong><span>Config Dibuat</span></div>
+    </section>
+    <footer class="site-footer landing-footer">CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  </div>
+<script>
+// Fetch public stats from Supabase (anon key, read-only)
+(async()=>{
+  const url="https://cgflrpjavyotvolnvcnl.supabase.co/rest/v1";
+  const key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNnZmxycGphdnlvdHZvbG52Y25sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MjU5MTYsImV4cCI6MjEwMTUwMTkxNn0.-e9GFpQBDBQUdAYsqfu7kuUwAQaY_Mf6dc3BhUuGNmc";
+  const h={"apikey":key,"Authorization":"Bearer "+key};
+  try{
+    const u=await fetch(url+"/users_custom?select=username",{headers:h}).then(r=>r.json());
+    const p=await fetch(url+"/proxy_pool?select=id&is_active=eq.true",{headers:h}).then(r=>r.json());
+    // workers + configs are per-user in user_states, can't aggregate via anon
+    document.getElementById("pubUsers").textContent=u?u.length:0;
+    document.getElementById("pubProxies").textContent=p?p.length:0;
+  }catch(e){}
+})();
+if("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>

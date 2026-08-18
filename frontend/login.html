@@ -1,0 +1,53 @@
+﻿<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>Masuk - CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+</head>
+<body class="auth-page">
+  <header class="public-topbar">
+    <a class="brand" href="landing.html">CFVPN <span>Hub</span></a>
+    <nav aria-label="Navigasi publik"><a class="nav-link" href="landing.html">Beranda</a></nav>
+  </header>
+  <main class="auth-shell">
+    <div class="auth-brand">
+      <div class="auth-logo" aria-hidden="true">⚡</div>
+      <h1>CFVPN Hub</h1>
+      <p class="auth-tagline">Worker rapi. Config siap pakai.</p>
+    </div>
+
+    <div class="auth-tabs" role="tablist">
+      <button class="auth-tab active" id="tabLogin" type="button" role="tab" aria-selected="true" aria-controls="paneLogin">Login</button>
+      <button class="auth-tab" id="tabRegister" type="button" role="tab" aria-selected="false" aria-controls="paneRegister">Register</button>
+    </div>
+
+    <section class="panel auth-card" id="paneLogin" role="tabpanel" aria-labelledby="tabLogin">
+      <form id="loginForm" class="deploy-form">
+        <label class="field"><span>Username</span><input id="loginUsername" type="text" autocomplete="username" required placeholder="Masukkan username"></label>
+        <label class="field"><span>Sandi</span><input id="loginPassword" type="password" autocomplete="current-password" required minlength="6" placeholder="Minimal 6 karakter"></label>
+        <p class="form-message" id="loginMessage" aria-live="polite"></p>
+        <button class="button primary auth-submit" type="submit">Masuk</button>
+      </form>
+    </section>
+
+    <section class="panel auth-card" id="paneRegister" role="tabpanel" aria-labelledby="tabRegister" hidden>
+      <form id="registerForm" class="deploy-form">
+        <label class="field"><span>Username</span><input id="registerUsername" type="text" autocomplete="username" required placeholder="Tanpa spasi"></label>
+        <label class="field"><span>Sandi</span><input id="registerPassword" type="password" autocomplete="new-password" required minlength="6" placeholder="Minimal 6 karakter"></label>
+        <label class="field"><span>Ulangi sandi</span><input id="registerConfirm" type="password" autocomplete="new-password" required minlength="6" placeholder="Ulangi sandi"></label>
+        <p class="form-message" id="registerMessage" aria-live="polite"></p>
+        <button class="button primary auth-submit" type="submit">Buat akun</button>
+      </form>
+    </section>
+  </main>
+  <footer class="site-footer">CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  <script type="module" src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>

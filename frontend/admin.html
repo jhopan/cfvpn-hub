@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>User Management - CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+<script>if(!localStorage.getItem("CFVPN-vpn-panel-session"))location.replace("landing.html");</script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html">CFVPN <span>Hub</span></a>
+    <nav>
+      <a class="nav-link" href="index.html">Dashboard</a>
+      <a class="nav-link" href="workers.html">Workers</a>
+      <a class="nav-link" href="generator.html">Generator</a>
+      <a class="nav-link" href="proxy.html">Proxy</a>
+      <a class="nav-link" href="deploy.html">Deploy</a>
+      <a class="nav-link active" href="admin.html" id="adminNav">User</a>
+    </nav>
+    <div class="profile"><span data-user-email></span><button class="logout" id="logoutButton" type="button">Logout</button></div>
+  </header>
+
+  <main>
+    <header class="page-header">
+      <div><h1>User Management</h1><p>Kelola semua user dan admin.</p></div>
+    </header>
+
+    <section class="stats">
+      <article class="stat-card"><p>Total User</p><strong id="statTotalUsers">—</strong><span>terdaftar</span></article>
+      <article class="stat-card"><p>Admin</p><strong id="statAdmins">—</strong><span>role admin</span></article>
+      <article class="stat-card"><p>User biasa</p><strong id="statRegularUsers">—</strong><span>role user</span></article>
+    </section>
+
+    <div class="admin-layout">
+      <section class="panel" aria-labelledby="add-admin-title">
+        <div class="panel-title"><span class="step-number">01</span><div><h2 id="add-admin-title">Tambah Admin</h2><p>Buat akun admin baru langsung.</p></div></div>
+        <form class="generator-form" id="addAdminForm" novalidate>
+          <label class="field"><span>Username</span><input id="newAdminUsername" type="text" required placeholder="username baru (tanpa spasi)"></label>
+          <label class="field"><span>Sandi</span><input id="newAdminPassword" type="password" required minlength="6" placeholder="Minimal 6 karakter"></label>
+          <p class="form-message" id="addAdminMessage" aria-live="polite"></p>
+          <button class="button primary" id="addAdminBtn" type="submit">Tambah Admin</button>
+        </form>
+      </section>
+
+      <section class="panel" aria-labelledby="user-list-title">
+        <div class="panel-title"><span class="step-number">02</span><div><h2 id="user-list-title">Daftar User</h2><p>Ubah role atau hapus user.</p></div></div>
+        <div class="proxy-tabs" style="margin-bottom:14px">
+          <button class="button secondary proxy-tab active" id="tabUsersBtn" type="button">Semua</button>
+          <button class="button secondary proxy-tab" id="tabAdminsBtn" type="button">Admin</button>
+        </div>
+        <div class="proxy-table-wrap" style="max-height:400px">
+          <table class="proxy-table" id="userTable">
+            <thead><tr><th>Username</th><th>Role</th><th>Aksi</th></tr></thead>
+            <tbody id="userTableBody"></tbody>
+          </table>
+        </div>
+        <p class="form-message" id="userMessage" aria-live="polite" style="margin-top:12px"></p>
+      </section>
+    </div>
+  </main>
+
+  <footer>CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  <script type="module" src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>

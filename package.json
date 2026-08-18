@@ -1,0 +1,16 @@
+{
+  "name": "jhopan-sub-pages",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler pages dev frontend --compatibility-date=2024-05-12",
+    "deploy": "wrangler pages deploy frontend --compatibility-date=2024-05-12"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "wrangler": "latest"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.3"
+  }
+}

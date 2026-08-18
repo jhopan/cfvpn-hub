@@ -1,0 +1,54 @@
+﻿<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a1020">
+  <title>Workers - CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+<script>if(!localStorage.getItem("CFVPN-vpn-panel-session"))location.replace("landing.html");</script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html">CFVPN <span>Hub</span></a>
+    <nav>
+      <a class="nav-link" href="index.html">Dashboard</a>
+      <a class="nav-link active" href="workers.html">Workers</a>
+      <a class="nav-link" href="generator.html">Generator</a>
+      <a class="nav-link" href="proxy.html">Proxy</a>
+      <a class="nav-link" href="deploy.html">Deploy</a><a class="nav-link" href="admin.html" id="adminNav" hidden>User</a>
+    </nav>
+    <div class="profile"><span data-user-email></span><button class="logout" id="logoutButton" type="button">Logout</button></div>
+  </header>
+  <main>
+    <header class="page-header">
+      <div><h1>Workers</h1><p>Daftar Worker VPN dan Load Balancer Anda.</p></div>
+      <button class="button primary" id="showAddWorker" type="button">Tambah Worker</button>
+          </header>
+
+    <form class="panel add-worker-form" id="addWorkerForm" hidden>
+      <div class="fields-row">
+        <label class="field"><span>Nama Worker (alias)</span><input id="workerName" required placeholder="Misal: VPN SG 1"></label>
+        <label class="field"><span>Domain Worker</span><input id="workerHost" required placeholder="vpn1.username.workers.dev" pattern="^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$"></label>
+        <label class="field"><span>Jenis</span><select id="workerType"><option value="vpn">VPN Worker</option><option value="load_balancer">Load Balancer</option></select></label>
+      </div>
+      <label class="field" id="vpnDomainsField" hidden><span>VPN Worker domains (pisahkan koma)</span><input id="workerVpnDomains" placeholder="vpn1.user.workers.dev, vpn2.user.workers.dev"></label>
+      <div class="form-actions">
+        <button class="button secondary" id="cancelAddWorker" type="button">Batal</button>
+        <button class="button primary" type="submit">Simpan Worker</button>
+      </div>
+    </form>
+
+    <div class="worker-grid" id="workerList"></div>
+    <div class="empty-state" id="emptyWorkers" hidden>
+      <p>Belum ada Worker yang ditambahkan.</p>
+      <button class="button secondary" onclick="document.getElementById('showAddWorker').click()" type="button">Tambah sekarang</button>
+    </div></main>
+  <footer>CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  <script type="module" src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>

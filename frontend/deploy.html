@@ -1,0 +1,87 @@
+﻿<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a1020">
+  <title>Deploy - CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+<script>if(!localStorage.getItem("CFVPN-vpn-panel-session"))location.replace("landing.html");</script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html">CFVPN <span>Hub</span></a>
+    <nav>
+      <a class="nav-link" href="index.html">Dashboard</a>
+      <a class="nav-link" href="workers.html">Workers</a>
+      <a class="nav-link" href="generator.html">Generator</a><a class="nav-link" href="proxy.html">Proxy</a>
+      <a class="nav-link active" href="deploy.html">Deploy</a><a class="nav-link" href="admin.html" id="adminNav" hidden>User</a>
+    </nav>
+    <div class="profile"><span data-user-email></span><button class="logout" id="logoutButton" type="button">Logout</button></div>
+  </header>
+  <main class="deploy-layout">
+    <section class="panel">
+      <p class="eyebrow">Cloudflare Integration</p>
+      <h1>Deploy Worker Otomatis</h1>
+      <p class="page-intro">Deploy VPN Worker atau Load Balancer langsung ke akun Cloudflare Anda tanpa menyentuh kode.</p>
+      
+      <form class="deploy-form" id="deployForm" autocomplete="off" novalidate>
+        <div class="fields-row">
+          <label class="field">
+            <span>GLOBAL API KEY CLOUDFLARE</span>
+            <input id="cfApiKey" type="password" required placeholder="••••••••••••" autocomplete="new-password">
+          </label>
+          <label class="field">
+            <span>EMAIL CLOUDFLARE</span>
+            <input id="cfEmail" type="email" required placeholder="Email akun CF Anda" autocomplete="off">
+          </label>
+        </div>
+        
+        <label class="field" style="margin-top: 15px;">
+          <span>ACCOUNT ID CLOUDFLARE</span>
+          <input id="cfAccountId" required placeholder="Contoh: 73570341c33dcc9783d5323433b374d2" autocomplete="off">
+        </label>
+
+        <hr style="border: 0; border-top: 1px solid var(--line); margin: 25px 0;">
+
+        <div class="fields-row">
+          <label class="field">
+            <span>JENIS WORKER</span>
+            <select id="deployType">
+              <option value="vpn">VPN Worker (VLESS/Trojan/SS)</option>
+              <option value="load_balancer">Load Balancer</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>NAMA WORKER</span>
+            <input id="deployName" required placeholder="Misal: cfvpn-vpn-sg" pattern="^[a-z0-9][a-z0-9-]*[a-z0-9]$" autocomplete="off" value="cfvpn-vpn">
+            <small style="margin-top: 4px;">Hanya huruf kecil, angka, dan strip (-). Tidak boleh diawali/akhiri strip.</small>
+          </label>
+        </div>
+
+        <label class="field" id="tierField" style="margin-top: 15px;">
+          <span>VERSI WORKER</span>
+          <select id="deployTier">
+            <option value="free">Free (UDP Relay: hobihaus)</option>
+            <option value="prem">Premium (UDP Relay: Railway)</option>
+          </select>
+        </label>
+
+        <p class="form-message" id="deployMessage" aria-live="polite"></p>
+
+        <div class="form-actions" style="margin-top: 15px;">
+          <button class="button secondary" id="cancelDeploy" type="button">Batal</button>
+          <button class="button primary" id="startDeployBtn" type="submit">Mulai Deploy</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  <footer>CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  <script type="module" src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>
+

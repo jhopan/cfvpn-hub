@@ -1,0 +1,137 @@
+﻿<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>Generator - CFVPN Hub</title>
+  <link rel="stylesheet" href="style.css"><link rel="manifest" href="manifest.json">
+<script>if(!localStorage.getItem("CFVPN-vpn-panel-session"))location.replace("landing.html");</script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html">CFVPN <span>Hub</span></a>
+    <nav aria-label="Navigasi utama">
+      <a class="nav-link" href="index.html">Dashboard</a>
+      <a class="nav-link" href="workers.html">Workers</a>
+      <a class="nav-link active" href="generator.html">Generator</a>
+      <a class="nav-link" href="proxy.html">Proxy</a>
+      <a class="nav-link" href="deploy.html">Deploy</a><a class="nav-link" href="admin.html" id="adminNav" hidden>User</a>
+    </nav>
+    <div class="profile"><span data-user-email></span><button class="logout" id="logoutButton" type="button">Logout</button></div>
+  </header>
+
+  <main>
+    <header class="generator-heading">
+      <div>
+        <p class="eyebrow">Config workspace</p>
+        <h1>Buat config VPN.</h1>
+        <p>Pilih Worker, proxy, dan output. Atau ambil langsung dari Load Balancer subscription.</p>
+      </div>
+      <div class="admin-toolbar" id="adminGenToolbar" hidden>
+        <button class="button secondary" id="genRefreshCache" type="button">↻ Refresh Cache</button>
+        <button class="button secondary" id="genForceCron" type="button">Force Cron</button>
+      </div>
+      <span class="workspace-state">Local generator</span>
+    </header>
+
+    <div class="generator-layout">
+      <section class="panel generator-panel" aria-labelledby="generator-title">
+        <div class="panel-title">
+          <span class="step-number">01</span>
+          <div><h2 id="generator-title">Pengaturan config</h2><p>Pilih mode: local generator atau subscription dari Load Balancer.</p></div>
+        </div>
+
+        <form class="generator-form" id="generatorForm" novalidate>
+          <label class="field">
+            <span>Mode</span>
+            <select id="modeSelect">
+              <option value="local">Local Generator (pilih proxy manual)</option>
+              <option value="subscription">Ambil dari Subscription (Load Balancer)</option>
+            </select>
+          </label>
+
+          <!-- LOCAL MODE -->
+          <div id="localMode">
+            <label class="field">
+              <span>Pilih Worker VPN</span>
+              <select id="workerSelect" required><option value="">Pilih VPN Worker</option></select>
+            </label>
+
+            <div class="fields-row">
+              <label class="field"><span>Protokol</span><select id="vpnSelect"><option value="vless">VLESS</option></select></label>
+              <label class="field"><span>Port</span><select id="portSelect"><option value="443">443 (TLS)</option><option value="80">80 (NTLS)</option></select></label>
+            </div>
+
+            <div class="fields-row">
+              <label class="field"><span>Format output</span><select id="formatSelect"><option value="raw">Raw (VLESS URI)</option><option value="v2ray">V2Ray (Base64)</option><option value="clash">Clash (YAML)</option><option value="sfa">Sing-box (JSON)</option></select></label>
+              <label class="field"><span>Jumlah config</span><input id="limitInput" type="number" min="1" max="100" value="1" required></label>
+            </div>
+
+            <div class="fields-row">
+              <label class="field"><span>Filter negara</span><select id="countrySelect"><option value="">Semua negara</option></select></label>
+              <label class="field"><span>Filter penyedia</span><select id="orgSelect"><option value="">Semua penyedia</option></select></label>
+            </div>
+
+            <label class="field">
+              <span>Proxy spesifik (opsional)</span>
+              <select id="proxySelect"><option value="">Acak (sesuai filter)</option></select>
+            </label>
+          </div>
+
+          <!-- SUBSCRIPTION MODE -->
+          <div id="subMode" hidden>
+            <label class="field">
+              <span>Pilih Load Balancer</span>
+              <select id="lbSelect"><option value="">Pilih Load Balancer</option></select>
+            </label>
+
+            <div class="fields-row">
+              <label class="field"><span>Format output</span><select id="subFormatSelect"><option value="raw">Raw (VLESS URI)</option><option value="v2ray">V2Ray (Base64)</option><option value="clash">Clash (YAML)</option></select></label>
+              <label class="field"><span>Jumlah config</span><input id="subLimitInput" type="number" min="1" max="100" value="20" required></label>
+            </div>
+
+            <label class="field">
+              <span>Filter negara (opsional)</span>
+              <input id="subCcInput" placeholder="Contoh: SG,ID (kosong = semua)">
+            </label>
+          </div>
+
+          <div class="preview-url">
+            <p class="eyebrow">Target aktif</p>
+            <code id="urlPreview">Pilih VPN Worker aktif dulu.</code>
+          </div>
+          <p class="form-message" id="formMessage" aria-live="polite"></p>
+          <button class="button primary generate-button" id="generateButton" type="submit">Buat Config</button>
+        </form>
+      </section>
+
+      <section class="panel result-panel" aria-labelledby="result-title">
+        <div class="result-header">
+          <div class="panel-title">
+            <span class="step-number">02</span>
+            <div><h2 id="result-title">Hasil config</h2><p>Config muncul di sini setelah proses selesai.</p></div>
+          </div>
+          <span class="badge" id="countBadge">0 config</span>
+        </div>
+        <textarea class="code-area" id="resultText" readonly placeholder="Belum ada config. Pilih Worker aktif lalu tekan Buat Config."></textarea>
+        <div class="sub-url-preview" id="subUrlPreview" hidden>
+          <p class="eyebrow">URL Subscription</p>
+          <div class="sub-row"><code class="sub-url" id="subUrlCode"></code><button class="icon-button" id="copySubUrlBtn" type="button">Copy</button><button class="icon-button" id="openSubUrlBtn" type="button">Buka</button></div>
+        </div>
+        <div class="result-actions">
+          <button class="button secondary" id="copyButton" type="button" disabled>Copy Config</button>
+          <button class="button secondary" id="downloadButton" type="button" disabled>Download File</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer>CFVPN Hub <span>·</span> by jhopanstore <span>·</span> Cloudflare Pages</footer>
+  <script type="module" src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
+</script>
+</body>
+</body>
+</html>

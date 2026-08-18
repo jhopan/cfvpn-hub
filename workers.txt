@@ -1,0 +1,4 @@
+vpn-sg-01
+vpn-sg-02
+vpn-id-01
+vpn-jp-01
