@@ -645,11 +645,27 @@ function renderGenerator() {
 function renderDeploy() {
   if (!$("deployForm")) return;
   $("cancelDeploy").onclick = () => { location.href = "workers.html"; };
-  
+
+  // Hide premium option for non-admin users
+  const tierField = $("tierField");
+  const tierSelect = $("deployTier");
+  if (tierSelect) {
+    const premOpt = tierSelect.querySelector('option[value="prem"]');
+    if (premOpt && currentUser?.role !== "admin") {
+      premOpt.hidden = true;
+      premOpt.disabled = true;
+      tierSelect.value = "free";
+    }
+    // Hide entire tier field if not admin
+    if (tierField && currentUser?.role !== "admin") {
+      tierField.hidden = true;
+    }
+  }
+
   $("deployForm").onsubmit = async (event) => { 
     event.preventDefault(); 
     const type = $("deployType").value; 
-    const name = $("deployName").value.trim().toLowerCase(); 
+    const name = $("deployName").value.trim().toLowerCase();
     
     const cfApiKey = $("cfApiKey").value.trim();
     const cfEmail = $("cfEmail").value.trim();
