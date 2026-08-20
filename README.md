@@ -58,9 +58,13 @@ cfvpn-hub/
 │   ├── src/index.js
 │   ├── package.json
 │   └── wrangler.toml
+├── deploy-bulk.mjs        # Script menu deploy Worker batch (lokal)
+├── workers.txt            # Input nama Worker, satu nama per baris
+├── deployed.txt           # Output URL Worker online (dibuat script)
+├── status.txt             # Output status Worker (dibuat script)
 ├── proxy-scraper/         # Scraper proxy (opsional)
 ├── tests/                 # Test files
-├── .env                   # Credentials (jangan commit!)
+├── .env                   # Credentials lokal (jangan commit!)
 ├── .gitignore
 ├── package.json
 └── wrangler.toml
@@ -166,8 +170,8 @@ Set env vars di `cron-worker/wrangler.toml` atau Cloudflare dashboard.
 
 | Role | Akses |
 |------|-------|
-| User | Dashboard, Workers, Generator, Proxy, Deploy (Free only) |
-| Admin | Semua + User Management, Deploy Premium, Refresh cache, Force cron |
+| User | Dashboard, Workers, Generator, Proxy, Deploy Worker Free |
+| Admin | Semua akses User + User Management, pilihan Worker Free/Premium, refresh cache, force cron |
 
 ## Deploy Worker (VPN/LB)
 
@@ -178,6 +182,56 @@ Set env vars di `cron-worker/wrangler.toml` atau Cloudflare dashboard.
 5. (Admin) Pilih versi: Free atau Premium
 6. Klik "Mulai Deploy"
 7. Worker ter-deploy + otomatis masuk ke daftar Workers
+
+**Batas role:** user biasa hanya mendapat Worker Free. Field versi Worker disembunyikan dan backend frontend selalu memilih `vpn-worker-free.js`. Admin dapat memilih Free atau Premium.
+
+## Bulk Deploy Script (Lokal)
+
+`deploy-bulk.mjs` adalah script lokal, bukan fitur frontend dan tidak ter-deploy ke Cloudflare Pages. Script membaca kredensial dari `.env`; jangan taruh key pada source code atau commit ke GitHub.
+
+Tambahkan kredensial Cloudflare ini ke `.env`:
+
+```env
+CF_EMAIL=your_email
+CF_API_KEY=your_cf_global_api_key
+CF_ACCOUNT_ID=your_account_id
+```
+
+Siapkan `workers.txt`, satu nama Worker per baris:
+
+```txt
+vpn-sg-01
+vpn-sg-02
+vpn-id-01
+```
+
+Jalankan:
+
+```bash
+node deploy-bulk.mjs
+```
+
+Menu tersedia:
+
+```txt
+1. Deploy Worker (dari file workers.txt)
+2. Deploy Worker (input manual)
+3. Cek Status Worker (baca deployed.txt)
+4. Cek Status Worker (input URL)
+5. Hapus Worker
+0. Keluar
+```
+
+Pada deploy, script memilih source Worker Free, Premium, atau Load Balancer; upload satu per satu; enable `workers.dev`; lalu cek endpoint `/myip`. Hanya Worker yang menjawab HTTP status `<500` dicatat sebagai online.
+
+Hasil deploy disimpan ke `deployed.txt`:
+
+```txt
+vpn-sg-01    https://vpn-sg-01.example.workers.dev    ✅ ONLINE
+vpn-id-01    GAGAL                                  ❌ - worker tidak response
+```
+
+Cek ulang dari menu 3 menghasilkan `status.txt`.
 
 ## Generator
 
