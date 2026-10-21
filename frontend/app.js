@@ -90,7 +90,9 @@ async function generateLocalConfigs(params) {
       };
     });
   } else if (supabase) {
-    let query = supabase.from('proxy_pool').select('*').eq('is_active', true);
+    // Hanya proxy yang benar-benar hidup: is_active + ping bagus + cek tidak basi
+    const freshLimit = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+    let query = supabase.from('proxy_pool').select('*').eq('is_active', true).gt('last_checked', freshLimit);
     if (params.ccList && params.ccList.length > 0) {
       query = query.in('country', params.ccList);
     }

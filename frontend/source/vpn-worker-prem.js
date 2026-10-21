@@ -1,6 +1,5 @@
 import { connect } from "cloudflare:sockets";
 
-let prxIP = "";
 const DNS_SERVER_ADDRESS = "8.8.8.8";
 const DNS_SERVER_PORT = 53;
 const RELAY_SERVER_UDP = {
@@ -24,8 +23,10 @@ export default {
       if (request.headers.get("Upgrade") === "websocket") {
         const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
         if (prxMatch) {
-          prxIP = prxMatch[1].replace("-", ":");
-          return await websocketHandler(request);
+          // prxIP harus per-koneksi, bukan variabel global (selain itu user
+          // saling menimpa proxy masing-masing)
+          const prxIP = prxMatch[1].replace("-", ":");
+          return await websocketHandler(request, prxIP);
         }
       }
 
@@ -52,7 +53,7 @@ export default {
   },
 };
 
-async function websocketHandler(request) {
+async function websocketHandler(request, prxIP) {
   const [client, webSocket] = Object.values(new WebSocketPair());
   webSocket.accept();
 
@@ -125,7 +126,8 @@ async function websocketHandler(request) {
         vlessHeader.portRemote,
         vlessHeader.rawClientData,
         webSocket,
-        vlessHeader.version
+        vlessHeader.version,
+        prxIP
       );
     }
   })).catch(() => {
@@ -181,7 +183,7 @@ function readVlessHeader(buffer) {
   };
 }
 
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader) {
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, prxIP) {
   async function connectAndWrite(address, port) {
     const isTLS = port === 443 || port === 8443;
     const tcpSocket = connect({ hostname: address, port: port, secureTransport: isTLS ? "on" : "off" });
