@@ -183,6 +183,79 @@ function readVlessHeader(buffer) {
   };
 }
 
+/**
+ * Connect ke tujuan lewat proxy HTTP atau SOCKS5.
+ * - HTTP   : CONNECT host:port HTTP/1.1
+ * - SOCKS5 : greeting 0x05, lalu CONNECT
+ * Port proxy 1080/9050/1081 -> SOCKS5, selain itu HTTP.
+ */
+async function connectViaProxy(proxyIP, proxyPort, targetHost, targetPort) {
+  const isSocks = [1080, 9050, 1081, 9051].includes(Number(proxyPort));
+
+  if (isSocks) {
+    const sock = connect({ hostname: proxyIP, port: proxyPort, secureTransport: "off" });
+    const writer = sock.writable.getWriter();
+    const reader = sock.readable.getReader();
+
+    // greeting: ver 5, 1 method, no auth
+    await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
+    await reader.read(); // server greeting
+
+    // CONNECT ke target
+    const hostBytes = new TextEncoder().encode(targetHost);
+    const req = new Uint8Array(7 + hostBytes.length);
+    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
+    req[4] = hostBytes.length;
+    req.set(hostBytes, 5);
+    const portBuf = new Uint8Array(2);
+    new DataView(portBuf.buffer).setUint16(0, targetPort);
+    req.set(portBuf, 5 + hostBytes.length);
+    await writer.write(req);
+
+    const reply = await reader.read();
+    const d = reply.value;
+    if (!d || d[1] !== 0x00) throw new Error("SOCKS5 CONNECT gagal");
+
+    // ganti reader dengan stream biasa supaya bisa dipakai remoteSocketToWS
+    sock.readable.cancel?.().catch(() => {});
+    return sock;
+  }
+
+  // HTTP proxy
+  const sock = connect({ hostname: proxyIP, port: proxyPort, secureTransport: "off" });
+  const writer = sock.writable.getWriter();
+  const reader = sock.readable.getReader();
+
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: keep-alive\r\n\r\n`;
+  await writer.write(new TextEncoder().encode(req));
+
+  // baca header
+  let buf = new Uint8Array(0);
+  while (true) {
+    const chunk = await reader.read();
+    if (!chunk || chunk.done) throw new Error("Proxy menutup koneksi");
+    const merged = new Uint8Array(buf.length + chunk.value.length);
+    merged.set(buf, 0);
+    merged.set(chunk.value, buf.length);
+    buf = merged;
+
+    const text = new TextDecoder().decode(buf);
+    const idx = text.indexOf("\r\n\r\n");
+    if (idx !== -1) {
+      const statusLine = text.slice(0, text.indexOf("\r\n"));
+      const m = statusLine.match(/^HTTP\/1\.[01]\s+(\d{3})/);
+      const code = m ? Number(m[1]) : 0;
+      if (code !== 200) throw new Error(`Proxy CONNECT kode ${code}`);
+      // sisa bytes setelah header (bisa ada data) - buang, tunnel mulai bersih
+      break;
+    }
+    if (buf.length > 8192) throw new Error("Header proxy terlalu besar");
+  }
+
+  sock.readable.cancel?.().catch(() => {});
+  return sock;
+}
+
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, prxIP) {
   async function connectAndWrite(address, port) {
     const isTLS = port === 443 || port === 8443;
@@ -195,12 +268,25 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     return tcpSocket;
   }
 
+  // Fallback lewat proxy. Proxy harus HTTP/SOCKS5 yang bisa forward, jadi
+  // pakai handshake proxy dulu (bukan tulis mentah).
   async function retry() {
-    const fallbackIP = prxIP.split(":")[0] || addressRemote;
-    const fallbackPort = prxIP.split(":")[1] || portRemote;
-    const tcpSocket = await connectAndWrite(fallbackIP, fallbackPort);
-    tcpSocket.closed.catch(() => {});
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
+    const parts = prxIP.split(":");
+    const fallbackIP = parts[0] || addressRemote;
+    const fallbackPort = Number(parts[1] || portRemote);
+
+    try {
+      const tcpSocket = await connectViaProxy(fallbackIP, fallbackPort, addressRemote, portRemote);
+      tcpSocket.closed.catch(() => {});
+      remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
+    } catch (err) {
+      // Proxy gagal -> coba langsung ke tujuan tanpa proxy
+      try {
+        const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+        tcpSocket.closed.catch(() => {});
+        remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
+      } catch (e2) {}
+    }
   }
 
   try {
