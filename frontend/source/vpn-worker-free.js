@@ -26,8 +26,16 @@ export default {
           // prxIP harus per-koneksi, bukan variabel global (selain itu user
           // saling menimpa proxy masing-masing)
           const prxIP = prxMatch[1].replace("-", ":");
-          return await websocketHandler(request, prxIP);
+          return await websocketHandler(request, prxIP, env);
         }
+      }
+
+      // Health check: worker hidup? (dipakai deploy script)
+      if (url.pathname === "/health") {
+        return new Response(
+          JSON.stringify({ ok: true, colo: request.cf?.colo, ts: Date.now() }),
+          { headers: { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" } }
+        );
       }
 
       if (url.pathname.startsWith("/myip")) {
@@ -53,8 +61,12 @@ export default {
   },
 };
 
-async function websocketHandler(request, prxIP) {
-  const [client, webSocket] = Object.values(new WebSocketPair());
+async function websocketHandler(request, prxIP, env) {
+  // PENTING: jangan pakai Object.values(new WebSocketPair()) - urutan key
+  // tidak dijamin oleh spec, bisa terbalik (client <-> server).
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const webSocket = pair[1];
   webSocket.accept();
 
   let remoteSocketWrapper = { value: null };
@@ -62,13 +74,27 @@ async function websocketHandler(request, prxIP) {
 
   let readableStreamCancel = false;
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+  let streamController = null;
   const readableWebSocketStream = new ReadableStream({
     start(controller) {
+      streamController = controller;
       if (earlyDataHeader) {
         try {
+          // Jangan enqueue di start(): consumer belum siap, Workers throw
+          // "Cannot enqueue to a closed stream". Tunda sampai stream ter-pull.
           const earlyData = Uint8Array.from(atob(earlyDataHeader.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)).buffer;
-          controller.enqueue(earlyData);
-        } catch(e) {}
+          queueMicrotask(() => {
+            try {
+              if (!readableStreamCancel && streamController) {
+                streamController.enqueue(earlyData);
+              }
+            } catch (e) {
+              console.log("earlyData enqueue gagal:", e.message);
+            }
+          });
+        } catch(e) {
+          // earlyData bukan base64 valid -> abaikan, koneksi tetap jalan
+        }
       }
       webSocket.addEventListener("message", (e) => {
         if (!readableStreamCancel) controller.enqueue(e.data);
@@ -82,7 +108,10 @@ async function websocketHandler(request, prxIP) {
         safeCloseWebSocket(webSocket);
       });
     },
-    cancel() { readableStreamCancel = true; }
+    cancel() {
+      readableStreamCancel = true;
+      try { streamController?.close(); } catch {}
+    }
   });
 
   readableWebSocketStream.pipeTo(new WritableStream({
@@ -99,12 +128,26 @@ async function websocketHandler(request, prxIP) {
 
       const vlessHeader = readVlessHeader(chunk);
       if (vlessHeader.hasError) {
-        const tcpSocket = connect({ hostname: prxIP.split(":")[0], port: prxIP.split(":")[1] || 443, secureTransport: "on" });
+        // bukan header VLESS -> bypass (mode raw TCP, misal SSH tunnel)
+        const parts = prxIP.split(":");
+        const tcpSocket = connect({
+          hostname: parts[0],
+          port: Number(parts[1] || 443),
+          secureTransport: "off",
+        });
         remoteSocketWrapper.value = tcpSocket;
         const writer = tcpSocket.writable.getWriter();
         writer.write(chunk);
         writer.releaseLock();
         remoteSocketToWS(tcpSocket, webSocket, null, null);
+        return;
+      }
+
+      // Validasi UUID. Tanpa ini worker = open relay untuk siapa saja.
+      // Allowlist diisi lewat env UUID_ALLOWLIST (comma separated) atau KV.
+      if (!isUuidAllowed(vlessHeader.uuid, env)) {
+        console.log(`UUID ditolak: ${vlessHeader.uuid}`);
+        safeCloseWebSocket(webSocket);
         return;
       }
 
@@ -135,6 +178,21 @@ async function websocketHandler(request, prxIP) {
   });
 
   return new Response(null, { status: 101, webSocket: client });
+}
+
+/**
+ * Validasi UUID user.
+ * - env.UUID_ALLOWLIST = "uuid1,uuid2" (comma separated)
+ * - env.UUID_KV = nama binding KV, kalau diisi UUID diambil dari KV key "uuids"
+ * Kalau tidak ada allowlist -> semua UUID diterima (mode terbuka, untuk dev).
+ */
+function isUuidAllowed(uuid, env) {
+  if (!env) return true;
+  const allowlist = env.UUID_ALLOWLIST;
+  if (!allowlist) return true;
+  const list = allowlist.split(",").map((u) => u.trim().toLowerCase()).filter(Boolean);
+  if (!list.length) return true;
+  return list.includes(String(uuid || "").toLowerCase());
 }
 
 function readVlessHeader(buffer) {
@@ -173,8 +231,14 @@ function readVlessHeader(buffer) {
     return { hasError: true, message: `Invalid VLESS address type: ${addressType}` };
   }
 
+  // UUID = 16 byte pada offset 2..18
+  const uuid = Array.from(new Uint8Array(buffer.slice(2, 18)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
   return {
     hasError: false,
+    uuid,
     addressRemote: addressValue,
     portRemote,
     rawClientData: buffer.slice(addressIndex + addressLength),
@@ -188,80 +252,133 @@ function readVlessHeader(buffer) {
  * - HTTP   : CONNECT host:port HTTP/1.1
  * - SOCKS5 : greeting 0x05, lalu CONNECT
  * Port proxy 1080/9050/1081 -> SOCKS5, selain itu HTTP.
+ *
+ * PENTING: sock.readable hanya boleh dibaca SEKALI. Setelah reader dipakai,
+ * stream terkunci. Jadi handshake dibaca via reader, lalu stream di-"reconstruct"
+ * supaya sisa byte (bila ada) tetap bisa diteruskan.
  */
 async function connectViaProxy(proxyIP, proxyPort, targetHost, targetPort) {
   const isSocks = [1080, 9050, 1081, 9051].includes(Number(proxyPort));
-
-  if (isSocks) {
-    const sock = connect({ hostname: proxyIP, port: proxyPort, secureTransport: "off" });
-    const writer = sock.writable.getWriter();
-    const reader = sock.readable.getReader();
-
-    // greeting: ver 5, 1 method, no auth
-    await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
-    await reader.read(); // server greeting
-
-    // CONNECT ke target
-    const hostBytes = new TextEncoder().encode(targetHost);
-    const req = new Uint8Array(7 + hostBytes.length);
-    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-    req[4] = hostBytes.length;
-    req.set(hostBytes, 5);
-    const portBuf = new Uint8Array(2);
-    new DataView(portBuf.buffer).setUint16(0, targetPort);
-    req.set(portBuf, 5 + hostBytes.length);
-    await writer.write(req);
-
-    const reply = await reader.read();
-    const d = reply.value;
-    if (!d || d[1] !== 0x00) throw new Error("SOCKS5 CONNECT gagal");
-
-    // ganti reader dengan stream biasa supaya bisa dipakai remoteSocketToWS
-    sock.readable.cancel?.().catch(() => {});
-    return sock;
-  }
-
-  // HTTP proxy
   const sock = connect({ hostname: proxyIP, port: proxyPort, secureTransport: "off" });
   const writer = sock.writable.getWriter();
   const reader = sock.readable.getReader();
 
-  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: keep-alive\r\n\r\n`;
-  await writer.write(new TextEncoder().encode(req));
+  try {
+    if (isSocks) {
+      // greeting: ver 5, 1 method, no auth
+      await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
+      const greet = await reader.read();
+      if (!greet.value || greet.value[0] !== 0x05) throw new Error("bukan SOCKS5");
+      if (greet.value[1] !== 0x00) throw new Error("SOCKS5 butuh auth");
 
-  // baca header
-  let buf = new Uint8Array(0);
-  while (true) {
-    const chunk = await reader.read();
-    if (!chunk || chunk.done) throw new Error("Proxy menutup koneksi");
-    const merged = new Uint8Array(buf.length + chunk.value.length);
-    merged.set(buf, 0);
-    merged.set(chunk.value, buf.length);
-    buf = merged;
+      // CONNECT ke target (domain name = ATYP 0x03)
+      const hostBytes = new TextEncoder().encode(targetHost);
+      const req = new Uint8Array(7 + hostBytes.length);
+      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
+      req[4] = hostBytes.length;
+      req.set(hostBytes, 5);
+      const portBuf = new Uint8Array(2);
+      new DataView(portBuf.buffer).setUint16(0, targetPort);
+      req.set(portBuf, 5 + hostBytes.length);
+      await writer.write(req);
 
-    const text = new TextDecoder().decode(buf);
-    const idx = text.indexOf("\r\n\r\n");
-    if (idx !== -1) {
-      const statusLine = text.slice(0, text.indexOf("\r\n"));
-      const m = statusLine.match(/^HTTP\/1\.[01]\s+(\d{3})/);
-      const code = m ? Number(m[1]) : 0;
-      if (code !== 200) throw new Error(`Proxy CONNECT kode ${code}`);
-      // sisa bytes setelah header (bisa ada data) - buang, tunnel mulai bersih
-      break;
+      const reply = await reader.read();
+      if (!reply.value || reply.value[1] !== 0x00) {
+        throw new Error(`SOCKS5 reply ${reply.value ? reply.value[1] : "?"}`);
+      }
+      return rebuildStream(sock, reader, null);
     }
-    if (buf.length > 8192) throw new Error("Header proxy terlalu besar");
-  }
 
-  sock.readable.cancel?.().catch(() => {});
-  return sock;
+    // HTTP proxy
+    const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: keep-alive\r\n\r\n`;
+    await writer.write(new TextEncoder().encode(req));
+
+    // baca header sampai \r\n\r\n
+    let buf = new Uint8Array(0);
+    let leftover = null;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done || !chunk.value) throw new Error("Proxy menutup koneksi");
+      const merged = new Uint8Array(buf.length + chunk.value.length);
+      merged.set(buf, 0);
+      merged.set(chunk.value, buf.length);
+      buf = merged;
+
+      const text = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 8192)));
+      const idx = text.indexOf("\r\n\r\n");
+      if (idx !== -1) {
+        const statusLine = text.slice(0, text.indexOf("\r\n"));
+        const m = statusLine.match(/^HTTP\/1\.[01]\s+(\d{3})/);
+        const code = m ? Number(m[1]) : 0;
+        if (code !== 200) throw new Error(`Proxy CONNECT kode ${code}`);
+        // byte setelah header (bila ada) = data tunnel awal
+        const headerEnd = idx + 4;
+        leftover = buf.length > headerEnd ? buf.slice(headerEnd) : null;
+        break;
+      }
+      if (buf.length > 8192) throw new Error("Header proxy terlalu besar");
+    }
+
+    return rebuildStream(sock, reader, leftover);
+  } catch (err) {
+    try { reader.cancel(); } catch {}
+    try { sock.close(); } catch {}
+    throw err;
+  }
+}
+
+/**
+ * Stream yang sudah dipakai reader.read() tidak bisa dilepas lock-nya.
+ * Solusi: buat ReadableStream baru yang menyambung reader yang sudah ada,
+ * jadi byte lanjutan (leftover) tetap diteruskan.
+ */
+function rebuildStream(sock, reader, leftover) {
+  const writable = new WritableStream({
+    async write(chunk) {
+      const w = sock.writable.getWriter();
+      try {
+        await w.write(chunk);
+      } finally {
+        w.releaseLock();
+      }
+    },
+    close() {
+      try { sock.close(); } catch {}
+    },
+    abort() {
+      try { sock.close(); } catch {}
+    },
+  });
+
+  const readable = new ReadableStream({
+    async start(controller) {
+      if (leftover && leftover.length) {
+        try { controller.enqueue(leftover); } catch {}
+      }
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) controller.enqueue(value);
+        }
+        controller.close();
+      } catch (err) {
+        try { controller.error(err); } catch {}
+      }
+    },
+    cancel() {
+      try { reader.cancel(); } catch {}
+      try { sock.close(); } catch {}
+    },
+  });
+
+  return { readable, writable, closed: sock.closed, close: () => sock.close() };
 }
 
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, prxIP) {
   async function connectAndWrite(address, port) {
     const isTLS = port === 443 || port === 8443;
     const tcpSocket = connect({ hostname: address, port: port, secureTransport: isTLS ? "on" : "off" });
-
-    remoteSocket.value = tcpSocket;
     const writer = tcpSocket.writable.getWriter();
     await writer.write(new Uint8Array(rawClientData));
     writer.releaseLock();
@@ -275,17 +392,27 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     const fallbackIP = parts[0] || addressRemote;
     const fallbackPort = Number(parts[1] || portRemote);
 
+    // 1) Coba lewat proxy (HTTP CONNECT / SOCKS5)
     try {
-      const tcpSocket = await connectViaProxy(fallbackIP, fallbackPort, addressRemote, portRemote);
+      const proxied = await connectViaProxy(fallbackIP, fallbackPort, addressRemote, portRemote);
+      const w = proxied.writable.getWriter();
+      await w.write(new Uint8Array(rawClientData));
+      w.releaseLock();
+      proxied.closed?.catch(() => {});
+      remoteSocketToWS(proxied, webSocket, responseHeader, null);
+      return;
+    } catch (err) {
+      console.log(`proxy gagal (${fallbackIP}:${fallbackPort}): ${err.message}`);
+    }
+
+    // 2) Proxy tidak bisa -> langsung ke tujuan
+    try {
+      const tcpSocket = await connectAndWrite(addressRemote, portRemote);
       tcpSocket.closed.catch(() => {});
       remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
-    } catch (err) {
-      // Proxy gagal -> coba langsung ke tujuan tanpa proxy
-      try {
-        const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-        tcpSocket.closed.catch(() => {});
-        remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
-      } catch (e2) {}
+    } catch (e2) {
+      console.log(`fallback langsung gagal: ${e2.message}`);
+      safeCloseWebSocket(webSocket);
     }
   }
 
@@ -321,19 +448,20 @@ async function remoteSocketToWS(
   remoteSocket,
   webSocket,
   responseHeader,
-  retry,
-  log
+  retry
 ) {
   let header = responseHeader;
   let hasIncomingData = false;
-  await remoteSocket.readable
-    .pipeTo(
+
+  try {
+    await remoteSocket.readable.pipeTo(
       new WritableStream({
         start() {},
         async write(chunk, controller) {
           hasIncomingData = true;
           if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-            controller.error("webSocket.readyState is not open, maybe close");
+            controller.error("webSocket not open");
+            return;
           }
           if (header) {
             webSocket.send(await new Blob([header, chunk]).arrayBuffer());
@@ -342,18 +470,20 @@ async function remoteSocketToWS(
             webSocket.send(chunk);
           }
         },
-        close() {
-        },
+        close() {},
         abort(reason) {
-          console.error(`remoteConnection!.readable abort`, reason);
+          console.error("remoteSocketToWS abort:", reason);
         },
       })
-    )
-    .catch((error) => {
-      console.error(`remoteSocketToWS has exception `, error.stack || error);
-      safeCloseWebSocket(webSocket);
-    });
-  if (hasIncomingData === false && retry) {
+    );
+  } catch (error) {
+    console.error("remoteSocketToWS exception:", error?.message || error);
+    safeCloseWebSocket(webSocket);
+    return;
+  }
+
+  // Tidak ada data sama sekali -> tunnel mungkin salah target, coba proxy
+  if (!hasIncomingData && retry) {
     retry();
   }
 }

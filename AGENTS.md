@@ -2,6 +2,14 @@
 
 Cloudflare VPN management panel. Frontend statis (vanilla JS) + Cloudflare Pages Functions + Supabase.
 
+## Environment
+
+Hermes terminal = **WSL2 bash**, bukan Git Bash.
+- Path Windows = `/mnt/c/Users/ACER/...` (bukan `/c/...`)
+- `node` tidak ada di WSL → pakai `nrun node <file>` (wrapper di `/mnt/c/Users/ACER/bin/nrun`)
+- Path di kode JS = native `C:/Users/ACER/...`
+- Detail lengkap: `C:/Users/ACER/AGENTS.md`
+
 ## Deploy
 
 ```bash
