@@ -26,7 +26,7 @@ export default {
           // prxIP harus per-koneksi, bukan variabel global (selain itu user
           // saling menimpa proxy masing-masing)
           const prxIP = prxMatch[1].replace("-", ":");
-          return await websocketHandler(request, prxIP, env);
+          return await websocketHandler(request, prxIP, env || {});
         }
       }
 
@@ -192,7 +192,13 @@ function isUuidAllowed(uuid, env) {
   if (!allowlist) return true;
   const list = allowlist.split(",").map((u) => u.trim().toLowerCase()).filter(Boolean);
   if (!list.length) return true;
-  return list.includes(String(uuid || "").toLowerCase());
+  // allowlist ditulis sebagai UUID berformat (8-4-4-4-12), sedangkan
+  // VLESS uuid datang sebagai 32 hex tanpa dash.
+  const hex = String(uuid || "").toLowerCase();
+  const dashed = hex.length === 32
+    ? `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
+    : hex;
+  return list.includes(hex) || list.includes(dashed);
 }
 
 function readVlessHeader(buffer) {
@@ -258,7 +264,8 @@ function readVlessHeader(buffer) {
  * supaya sisa byte (bila ada) tetap bisa diteruskan.
  */
 async function connectViaProxy(proxyIP, proxyPort, targetHost, targetPort) {
-  const isSocks = [1080, 9050, 1081, 9051].includes(Number(proxyPort));
+  // Port SOCKS5/SOCKS4 umum. Port lain dianggap HTTP proxy.
+  const isSocks = [1080, 9050, 1081, 9051, 1082, 4145, 9150].includes(Number(proxyPort));
   const sock = connect({ hostname: proxyIP, port: proxyPort, secureTransport: "off" });
   const writer = sock.writable.getWriter();
   const reader = sock.readable.getReader();
@@ -402,7 +409,24 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
       remoteSocketToWS(proxied, webSocket, responseHeader, null);
       return;
     } catch (err) {
-      console.log(`proxy gagal (${fallbackIP}:${fallbackPort}): ${err.message}`);
+      console.log(`proxy handshake gagal (${fallbackIP}:${fallbackPort}): ${err.message}`);
+    }
+
+    // 2) Proxy tanpa handshake = raw TCP forwarder: tulis mentah, tanpa CONNECT
+    try {
+      const raw = connect({
+        hostname: fallbackIP,
+        port: fallbackPort,
+        secureTransport: "off",
+      });
+      const w = raw.writable.getWriter();
+      await w.write(new Uint8Array(rawClientData));
+      w.releaseLock();
+      raw.closed?.catch(() => {});
+      remoteSocketToWS(raw, webSocket, responseHeader, null);
+      return;
+    } catch (err) {
+      console.log(`proxy raw gagal: ${err.message}`);
     }
 
     // 2) Proxy tidak bisa -> langsung ke tujuan
