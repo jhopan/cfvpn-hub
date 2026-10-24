@@ -1,0 +1,50 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "port": 10808,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vless-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "cfvpn-vpn-free.terabox-hub.workers.dev",
+            "port": 443,
+            "users": [
+              {
+                "id": "d8841445-3f34-41c2-aadc-bbd755241685",
+                "encryption": "none",
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "cfvpn-vpn-free.terabox-hub.workers.dev",
+          "verifyPeerCertByName": "cfvpn-vpn-free.terabox-hub.workers.dev"
+        },
+        "wsSettings": {
+          "path": "/118.71.227.154:1092",
+          "host": "cfvpn-vpn-free.terabox-hub.workers.dev"
+        }
+      }
+    }
+  ]
+}

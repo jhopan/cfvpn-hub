@@ -172,27 +172,11 @@ async function handleClientChunk(chunk, state, webSocket, prxIP, env) {
     return;
   }
 
-  if (tryDirect(header, webSocket, state)) return;
-
+  // Cloudflare memblokir connect() ke port HTTP/HTTPS (80/443):
+  //   "cannot connect to the specified address. It looks like you might be
+  //    trying to connect to a HTTP-based service - consider using fetch"
+  // Jadi SEMUA koneksi harus lewat proxy, tidak ada jalur direct.
   await tryViaProxy(header, webSocket, state, prxIP);
-}
-
-function tryDirect(header, webSocket, state) {
-  try {
-    const isTLS = header.portRemote === 443 || header.portRemote === 8443;
-    const sock = connect({
-      hostname: header.addressRemote,
-      port: header.portRemote,
-      secureTransport: isTLS ? "on" : "off",
-    });
-    state.remote = { readable: sock.readable, writable: sock.writable, closed: sock.closed, close: function () { sock.close(); } };
-    const w = sock.writable.getWriter();
-    w.write(new Uint8Array(header.rawClientData)).then(function () { w.releaseLock(); }).catch(function () {});
-    pipeRemoteToWs(state.remote, webSocket, header.version, null);
-    return true;
-  } catch (e) {
-    return false;
-  }
 }
 
 async function tryViaProxy(header, webSocket, state, prxIP) {
