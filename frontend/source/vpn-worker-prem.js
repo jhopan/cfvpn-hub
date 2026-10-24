@@ -1,19 +1,29 @@
+// CFVPN Hub - VPN Worker (VLESS over WebSocket)
+//
+// Alur:
+//   WebSocket + path /ip:port  -> VLESS tunnel lewat proxy
+//   /health                    -> health check JSON
+//   /myip                      -> info IP client
+//   HTTP biasa                 -> reverse proxy (kamuflase)
+//
+// Proxy dipakai lewat SOCKS5 dulu, lalu HTTP CONNECT. Protokol dideteksi
+// dari respons, bukan dari nomor port (proxy SOCKS5 sering di 443).
+
 import { connect } from "cloudflare:sockets";
 
 const DNS_SERVER_ADDRESS = "8.8.8.8";
 const DNS_SERVER_PORT = 53;
-const RELAY_SERVER_UDP = {
-  host: "relay-server-production-6026.up.railway.app",
-  port: 7300,
-};
+const RELAY_SERVER_UDP = { host: "relay-server-production-6026.up.railway.app", port: 7300 };
 
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
-const CORS_HEADER_OPTIONS = {
+const WS_OPEN = 1;
+const WS_CLOSING = 2;
+const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
   "Access-Control-Max-Age": "86400",
 };
+
+const PROXY_HANDSHAKE_TIMEOUT = 8000;
 
 export default {
   async fetch(request, env) {
@@ -21,20 +31,17 @@ export default {
       const url = new URL(request.url);
 
       if (request.headers.get("Upgrade") === "websocket") {
-        const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-        if (prxMatch) {
-          // prxIP harus per-koneksi, bukan variabel global (selain itu user
-          // saling menimpa proxy masing-masing)
-          const prxIP = prxMatch[1].replace("-", ":");
+        const m = url.pathname.match(/^\/(.+[:=-]\d+)$/);
+        if (m) {
+          const prxIP = m[1].replace("-", ":");
           return await websocketHandler(request, prxIP, env);
         }
       }
 
-      // Health check: worker hidup? (dipakai deploy script)
       if (url.pathname === "/health") {
         return new Response(
           JSON.stringify({ ok: true, colo: request.cf?.colo, ts: Date.now() }),
-          { headers: { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" } }
+          { headers: { ...CORS, "Content-Type": "application/json" } }
         );
       }
 
@@ -43,455 +50,504 @@ export default {
           ip: request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip"),
           colo: request.headers.get("cf-ray")?.split("-")[1],
           ...request.cf,
-        }), { headers: CORS_HEADER_OPTIONS });
+        }), { headers: CORS });
       }
 
-      const targetReversePrx = env.REVERSE_PRX_TARGET || "example.com";
+      const target = (env && env.REVERSE_PRX_TARGET) || "example.com";
       const targetUrl = new URL(request.url);
-      targetUrl.hostname = targetReversePrx;
-      const modifiedRequest = new Request(targetUrl, request);
-      modifiedRequest.headers.set("X-Forwarded-Host", request.headers.get("Host"));
-      const response = await fetch(modifiedRequest);
-      const newResponse = new Response(response.body, response);
-      for (const [k, v] of Object.entries(CORS_HEADER_OPTIONS)) newResponse.headers.set(k, v);
-      return newResponse;
+      targetUrl.hostname = target;
+      const modified = new Request(targetUrl, request);
+      modified.headers.set("X-Forwarded-Host", request.headers.get("Host"));
+      const response = await fetch(modified);
+      const out = new Response(response.body, response);
+      for (const [k, v] of Object.entries(CORS)) out.headers.set(k, v);
+      return out;
     } catch (err) {
-      return new Response(`Error: ${err.message}`, { status: 500, headers: CORS_HEADER_OPTIONS });
+      return new Response("Error: " + err.message, { status: 500, headers: CORS });
     }
   },
 };
 
 async function websocketHandler(request, prxIP, env) {
-  // PENTING: jangan pakai Object.values(new WebSocketPair()) - urutan key
-  // tidak dijamin oleh spec, bisa terbalik (client <-> server).
   const pair = new WebSocketPair();
   const client = pair[0];
   const webSocket = pair[1];
   webSocket.accept();
 
-  let remoteSocketWrapper = { value: null };
-  let isDNS = false;
+  const state = { remote: null, isDNS: false, cancelled: false };
+  const earlyData = request.headers.get("sec-websocket-protocol") || "";
 
-  let readableStreamCancel = false;
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-  let streamController = null;
-  const readableWebSocketStream = new ReadableStream({
+  const incoming = new ReadableStream({
     start(controller) {
-      streamController = controller;
-      if (earlyDataHeader) {
+      if (earlyData) {
         try {
-          // Jangan enqueue di start(): consumer belum siap, Workers throw
-          // "Cannot enqueue to a closed stream". Tunda sampai stream ter-pull.
-          const earlyData = Uint8Array.from(atob(earlyDataHeader.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)).buffer;
+          const bin = atob(earlyData.replace(/-/g, "+").replace(/_/g, "/"));
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
           queueMicrotask(() => {
-            try {
-              if (!readableStreamCancel && streamController) {
-                streamController.enqueue(earlyData);
-              }
-            } catch (e) {
-              console.log("earlyData enqueue gagal:", e.message);
+            if (!state.cancelled) {
+              try { controller.enqueue(bytes.buffer); } catch (e) {}
             }
           });
-        } catch(e) {
-          // earlyData bukan base64 valid -> abaikan, koneksi tetap jalan
-        }
+        } catch (e) {}
       }
-      webSocket.addEventListener("message", (e) => {
-        if (!readableStreamCancel) controller.enqueue(e.data);
+
+      webSocket.addEventListener("message", function (e) {
+        if (!state.cancelled) {
+          try { controller.enqueue(e.data); } catch (err) {}
+        }
       });
-      webSocket.addEventListener("close", () => {
-        if (!readableStreamCancel) controller.close();
-        safeCloseWebSocket(webSocket);
+      webSocket.addEventListener("close", function () {
+        if (!state.cancelled) {
+          try { controller.close(); } catch (err) {}
+        }
+        safeClose(webSocket);
       });
-      webSocket.addEventListener("error", () => {
-        if (!readableStreamCancel) controller.error(new Error("WS error"));
-        safeCloseWebSocket(webSocket);
+      webSocket.addEventListener("error", function () {
+        if (!state.cancelled) {
+          try { controller.error(new Error("ws error")); } catch (err) {}
+        }
+        safeClose(webSocket);
       });
     },
     cancel() {
-      readableStreamCancel = true;
-      try { streamController?.close(); } catch {}
-    }
+      state.cancelled = true;
+    },
   });
 
-  readableWebSocketStream.pipeTo(new WritableStream({
-    async write(chunk) {
-      if (isDNS) {
-        return handleUDPOutbound(DNS_SERVER_ADDRESS, DNS_SERVER_PORT, chunk, webSocket, null, RELAY_SERVER_UDP);
-      }
-      if (remoteSocketWrapper.value) {
-        const writer = remoteSocketWrapper.value.writable.getWriter();
-        await writer.write(chunk);
-        writer.releaseLock();
-        return;
-      }
-
-      const vlessHeader = readVlessHeader(chunk);
-      if (vlessHeader.hasError) {
-        // bukan header VLESS -> bypass (mode raw TCP, misal SSH tunnel)
-        const parts = prxIP.split(":");
-        const tcpSocket = connect({
-          hostname: parts[0],
-          port: Number(parts[1] || 443),
-          secureTransport: "off",
-        });
-        remoteSocketWrapper.value = tcpSocket;
-        const writer = tcpSocket.writable.getWriter();
-        writer.write(chunk);
-        writer.releaseLock();
-        remoteSocketToWS(tcpSocket, webSocket, null, null);
-        return;
-      }
-
-      // Validasi UUID. Tanpa ini worker = open relay untuk siapa saja.
-      // Allowlist diisi lewat env UUID_ALLOWLIST (comma separated) atau KV.
-      if (!isUuidAllowed(vlessHeader.uuid, env)) {
-        console.log(`UUID ditolak: ${vlessHeader.uuid}`);
-        safeCloseWebSocket(webSocket);
-        return;
-      }
-
-      if (vlessHeader.isUDP) {
-        if (vlessHeader.portRemote === 53) isDNS = true;
-        return handleUDPOutbound(
-          isDNS ? DNS_SERVER_ADDRESS : vlessHeader.addressRemote,
-          isDNS ? DNS_SERVER_PORT : vlessHeader.portRemote,
-          chunk,
-          webSocket,
-          vlessHeader.version,
-          RELAY_SERVER_UDP
-        );
-      }
-
-      handleTCPOutBound(
-        remoteSocketWrapper,
-        vlessHeader.addressRemote,
-        vlessHeader.portRemote,
-        vlessHeader.rawClientData,
-        webSocket,
-        vlessHeader.version,
-        prxIP
-      );
-    }
-  })).catch(() => {
-    safeCloseWebSocket(webSocket);
-  });
+  incoming
+    .pipeTo(new WritableStream({
+      async write(chunk) {
+        await handleClientChunk(chunk, state, webSocket, prxIP, env);
+      },
+    }))
+    .catch(function () { safeClose(webSocket); });
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-/**
- * Validasi UUID user.
- * - env.UUID_ALLOWLIST = "uuid1,uuid2" (comma separated)
- * - env.UUID_KV = nama binding KV, kalau diisi UUID diambil dari KV key "uuids"
- * Kalau tidak ada allowlist -> semua UUID diterima (mode terbuka, untuk dev).
- */
-function isUuidAllowed(uuid, env) {
-  if (!env) return true;
-  const allowlist = env.UUID_ALLOWLIST;
-  if (!allowlist) return true;
-  const list = allowlist.split(",").map((u) => u.trim().toLowerCase()).filter(Boolean);
-  if (!list.length) return true;
-  return list.includes(String(uuid || "").toLowerCase());
-}
-
-function readVlessHeader(buffer) {
-  if (buffer.byteLength < 24) return { hasError: true, message: "Invalid data length" };
-  const version = new Uint8Array(buffer.slice(0, 1));
-  let isUDP = false;
-  const optLength = new Uint8Array(buffer.slice(17, 18))[0];
-  const cmd = new Uint8Array(buffer.slice(18 + optLength, 18 + optLength + 1))[0];
-
-  if (cmd === 2) isUDP = true;
-  else if (cmd !== 1) return { hasError: true, message: `Invalid VLESS command: ${cmd}` };
-
-  const portIndex = 18 + optLength + 1;
-  const portRemote = new DataView(buffer.slice(portIndex, portIndex + 2)).getUint16(0);
-  let addressIndex = portIndex + 2;
-  const addressType = new Uint8Array(buffer.slice(addressIndex, addressIndex + 1))[0];
-  addressIndex += 1;
-
-  let addressLength = 0;
-  let addressValue = "";
-
-  if (addressType === 1) {
-    addressLength = 4;
-    addressValue = new Uint8Array(buffer.slice(addressIndex, addressIndex + addressLength)).join(".");
-  } else if (addressType === 2) {
-    addressLength = new Uint8Array(buffer.slice(addressIndex, addressIndex + 1))[0];
-    addressIndex += 1;
-    addressValue = new TextDecoder().decode(buffer.slice(addressIndex, addressIndex + addressLength));
-  } else if (addressType === 3) {
-    addressLength = 16;
-    const dataView = new DataView(buffer.slice(addressIndex, addressIndex + addressLength));
-    const ipv6 = [];
-    for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
-    addressValue = ipv6.join(":");
-  } else {
-    return { hasError: true, message: `Invalid VLESS address type: ${addressType}` };
+async function handleClientChunk(chunk, state, webSocket, prxIP, env) {
+  if (state.remote) {
+    const w = state.remote.writable.getWriter();
+    try {
+      await w.write(chunk);
+    } finally {
+      w.releaseLock();
+    }
+    return;
   }
 
-  // UUID = 16 byte pada offset 2..18
-  const uuid = Array.from(new Uint8Array(buffer.slice(2, 18)))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  const header = readVlessHeader(chunk);
 
-  return {
-    hasError: false,
-    uuid,
-    addressRemote: addressValue,
-    portRemote,
-    rawClientData: buffer.slice(addressIndex + addressLength),
-    version: new Uint8Array([version[0], 0]),
-    isUDP,
-  };
+  if (header.hasError) {
+    const parts = String(prxIP).split(":");
+    const sock = connect({
+      hostname: parts[0],
+      port: Number(parts[1] || 443),
+      secureTransport: "off",
+    });
+    const w = sock.writable.getWriter();
+    await w.write(chunk);
+    w.releaseLock();
+    state.remote = { readable: sock.readable, writable: sock.writable, closed: sock.closed, close: function () { sock.close(); } };
+    pipeRemoteToWs(state.remote, webSocket, null, null);
+    return;
+  }
+
+  if (!isUuidAllowed(header.uuid, env)) {
+    safeClose(webSocket);
+    return;
+  }
+
+  if (header.isUDP) {
+    if (header.portRemote === 53) state.isDNS = true;
+    const targetHost = state.isDNS ? DNS_SERVER_ADDRESS : header.addressRemote;
+    const targetPort = state.isDNS ? DNS_SERVER_PORT : header.portRemote;
+    const sock = await openUdpRelay(targetHost, targetPort, RELAY_SERVER_UDP);
+    const w = sock.writable.getWriter();
+    await w.write(chunk);
+    w.releaseLock();
+    state.remote = sock;
+    pipeRemoteToWs(sock, webSocket, null, null);
+    return;
+  }
+
+  if (tryDirect(header, webSocket, state)) return;
+
+  await tryViaProxy(header, webSocket, state, prxIP);
 }
 
-/**
- * Connect ke tujuan lewat proxy HTTP atau SOCKS5.
- * - HTTP   : CONNECT host:port HTTP/1.1
- * - SOCKS5 : greeting 0x05, lalu CONNECT
- * Port proxy 1080/9050/1081 -> SOCKS5, selain itu HTTP.
- *
- * PENTING: sock.readable hanya boleh dibaca SEKALI. Setelah reader dipakai,
- * stream terkunci. Jadi handshake dibaca via reader, lalu stream di-"reconstruct"
- * supaya sisa byte (bila ada) tetap bisa diteruskan.
- */
-async function connectViaProxy(proxyIP, proxyPort, targetHost, targetPort) {
-  const isSocks = [1080, 9050, 1081, 9051].includes(Number(proxyPort));
-  const sock = connect({ hostname: proxyIP, port: proxyPort, secureTransport: "off" });
+function tryDirect(header, webSocket, state) {
+  try {
+    const isTLS = header.portRemote === 443 || header.portRemote === 8443;
+    const sock = connect({
+      hostname: header.addressRemote,
+      port: header.portRemote,
+      secureTransport: isTLS ? "on" : "off",
+    });
+    state.remote = { readable: sock.readable, writable: sock.writable, closed: sock.closed, close: function () { sock.close(); } };
+    const w = sock.writable.getWriter();
+    w.write(new Uint8Array(header.rawClientData)).then(function () { w.releaseLock(); }).catch(function () {});
+    pipeRemoteToWs(state.remote, webSocket, header.version, null);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function tryViaProxy(header, webSocket, state, prxIP) {
+  const parts = String(prxIP).split(":");
+  const proxyHost = parts[0];
+  const proxyPort = Number(parts[1] || 443);
+
+  try {
+    const tunnel = await openProxyTunnel(
+      proxyHost, proxyPort, header.addressRemote, header.portRemote, PROXY_HANDSHAKE_TIMEOUT
+    );
+    const w = tunnel.writable.getWriter();
+    await w.write(new Uint8Array(header.rawClientData));
+    w.releaseLock();
+    state.remote = tunnel;
+    pipeRemoteToWs(tunnel, webSocket, header.version, null);
+  } catch (err) {
+    console.log("proxy gagal: " + err.message);
+    safeClose(webSocket);
+  }
+}
+
+async function openProxyTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+  const errors = [];
+  try {
+    return await socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
+  } catch (e) {
+    errors.push("socks5: " + e.message);
+  }
+  try {
+    return await httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
+  } catch (e) {
+    errors.push("http: " + e.message);
+  }
+  throw new Error(errors.join(" | "));
+}
+
+async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+  const sock = connect({ hostname: proxyHost, port: proxyPort, secureTransport: "off" });
   const writer = sock.writable.getWriter();
   const reader = sock.readable.getReader();
 
   try {
-    if (isSocks) {
-      // greeting: ver 5, 1 method, no auth
-      await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
-      const greet = await reader.read();
-      if (!greet.value || greet.value[0] !== 0x05) throw new Error("bukan SOCKS5");
-      if (greet.value[1] !== 0x00) throw new Error("SOCKS5 butuh auth");
+    await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
+    const g = await readBytes(reader, 2, timeoutMs, "socks5-greeting");
+    if (g.bytes[0] !== 0x05) throw new Error("bukan SOCKS5");
+    if (g.bytes[1] !== 0x00) throw new Error("butuh auth");
 
-      // CONNECT ke target (domain name = ATYP 0x03)
-      const hostBytes = new TextEncoder().encode(targetHost);
-      const req = new Uint8Array(7 + hostBytes.length);
-      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-      req[4] = hostBytes.length;
-      req.set(hostBytes, 5);
-      const portBuf = new Uint8Array(2);
-      new DataView(portBuf.buffer).setUint16(0, targetPort);
-      req.set(portBuf, 5 + hostBytes.length);
-      await writer.write(req);
+    const hostBytes = new TextEncoder().encode(targetHost);
+    const req = new Uint8Array(5 + hostBytes.length + 2);
+    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
+    req[4] = hostBytes.length;
+    req.set(hostBytes, 5);
+    new DataView(req.buffer).setUint16(5 + hostBytes.length, targetPort);
+    await writer.write(req);
 
-      const reply = await reader.read();
-      if (!reply.value || reply.value[1] !== 0x00) {
-        throw new Error(`SOCKS5 reply ${reply.value ? reply.value[1] : "?"}`);
+    const h = await readBytes(reader, 4, timeoutMs, "socks5-reply");
+    if (h.bytes[1] !== 0x00) throw new Error("CONNECT ditolak " + h.bytes[1]);
+
+    let pending = h.leftover;
+    const atyp = h.bytes[3];
+    let need;
+    if (atyp === 0x01) {
+      need = 6;
+    } else if (atyp === 0x04) {
+      need = 18;
+    } else if (atyp === 0x03) {
+      let len;
+      if (pending && pending.length >= 1) {
+        len = pending[0];
+        pending = pending.length > 1 ? pending.slice(1) : null;
+      } else {
+        const lb = await readBytes(reader, 1, timeoutMs, "socks5-atyp");
+        len = lb.bytes[0];
+        pending = lb.leftover;
       }
-      return rebuildStream(sock, reader, null);
+      need = len + 2;
+    } else {
+      throw new Error("ATYP " + atyp);
     }
 
-    // HTTP proxy
-    const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: keep-alive\r\n\r\n`;
-    await writer.write(new TextEncoder().encode(req));
-
-    // baca header sampai \r\n\r\n
-    let buf = new Uint8Array(0);
-    let leftover = null;
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done || !chunk.value) throw new Error("Proxy menutup koneksi");
-      const merged = new Uint8Array(buf.length + chunk.value.length);
-      merged.set(buf, 0);
-      merged.set(chunk.value, buf.length);
-      buf = merged;
-
-      const text = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 8192)));
-      const idx = text.indexOf("\r\n\r\n");
-      if (idx !== -1) {
-        const statusLine = text.slice(0, text.indexOf("\r\n"));
-        const m = statusLine.match(/^HTTP\/1\.[01]\s+(\d{3})/);
-        const code = m ? Number(m[1]) : 0;
-        if (code !== 200) throw new Error(`Proxy CONNECT kode ${code}`);
-        // byte setelah header (bila ada) = data tunnel awal
-        const headerEnd = idx + 4;
-        leftover = buf.length > headerEnd ? buf.slice(headerEnd) : null;
-        break;
+    if (pending && pending.length) {
+      if (pending.length >= need) {
+        pending = pending.length > need ? pending.slice(need) : null;
+        need = 0;
+      } else {
+        need -= pending.length;
+        pending = null;
       }
-      if (buf.length > 8192) throw new Error("Header proxy terlalu besar");
+    }
+    if (need > 0) {
+      const rest = await readBytes(reader, need, timeoutMs, "socks5-bind");
+      pending = rest.leftover;
     }
 
-    return rebuildStream(sock, reader, leftover);
+    return rebuildTunnel(sock, reader, pending, writer);
   } catch (err) {
-    try { reader.cancel(); } catch {}
-    try { sock.close(); } catch {}
+    try { reader.cancel(); } catch (e) {}
+    try { writer.releaseLock(); } catch (e) {}
+    try { sock.close(); } catch (e) {}
     throw err;
   }
 }
 
-/**
- * Stream yang sudah dipakai reader.read() tidak bisa dilepas lock-nya.
- * Solusi: buat ReadableStream baru yang menyambung reader yang sudah ada,
- * jadi byte lanjutan (leftover) tetap diteruskan.
- */
-function rebuildStream(sock, reader, leftover) {
+async function httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+  const sock = connect({ hostname: proxyHost, port: proxyPort, secureTransport: "off" });
+  const writer = sock.writable.getWriter();
+  const reader = sock.readable.getReader();
+
+  try {
+    const req = "CONNECT " + targetHost + ":" + targetPort + " HTTP/1.1\r\n" +
+      "Host: " + targetHost + ":" + targetPort + "\r\n" +
+      "User-Agent: Mozilla/5.0\r\n\r\n";
+    await writer.write(new TextEncoder().encode(req));
+
+    const r = await readUntil(reader, "\r\n\r\n", timeoutMs, 8192, "http-connect");
+    const line = r.head.split("\r\n")[0] || "";
+    const m = line.match(/^HTTP\/1\.[01]\s+(\d{3})/);
+    if (!m) throw new Error("bukan HTTP proxy");
+    const code = Number(m[1]);
+    if (code !== 200) throw new Error("CONNECT ditolak " + code);
+
+    return rebuildTunnel(sock, reader, r.rest, writer);
+  } catch (err) {
+    try { reader.cancel(); } catch (e) {}
+    try { writer.releaseLock(); } catch (e) {}
+    try { sock.close(); } catch (e) {}
+    throw err;
+  }
+}
+
+function rebuildTunnel(sock, reader, leftover, writer) {
   const writable = new WritableStream({
     async write(chunk) {
-      const w = sock.writable.getWriter();
-      try {
-        await w.write(chunk);
-      } finally {
-        w.releaseLock();
-      }
+      await writer.write(chunk);
     },
     close() {
-      try { sock.close(); } catch {}
+      try { writer.close(); } catch (e) {}
+      try { sock.close(); } catch (e) {}
     },
     abort() {
-      try { sock.close(); } catch {}
+      try { sock.close(); } catch (e) {}
     },
   });
 
   const readable = new ReadableStream({
     async start(controller) {
       if (leftover && leftover.length) {
-        try { controller.enqueue(leftover); } catch {}
+        try { controller.enqueue(leftover); } catch (e) {}
       }
       try {
         for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value) controller.enqueue(value);
+          const r = await reader.read();
+          if (r.done) break;
+          if (r.value && r.value.length) controller.enqueue(r.value);
         }
-        controller.close();
+        try { controller.close(); } catch (e) {}
       } catch (err) {
-        try { controller.error(err); } catch {}
+        try { controller.error(err); } catch (e) {}
       }
     },
     cancel() {
-      try { reader.cancel(); } catch {}
-      try { sock.close(); } catch {}
+      try { reader.cancel(); } catch (e) {}
+      try { sock.close(); } catch (e) {}
     },
   });
 
-  return { readable, writable, closed: sock.closed, close: () => sock.close() };
+  return { readable: readable, writable: writable, closed: sock.closed, close: function () { sock.close(); } };
 }
 
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, prxIP) {
-  async function connectAndWrite(address, port) {
-    const isTLS = port === 443 || port === 8443;
-    const tcpSocket = connect({ hostname: address, port: port, secureTransport: isTLS ? "on" : "off" });
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(new Uint8Array(rawClientData));
-    writer.releaseLock();
-    return tcpSocket;
+async function openUdpRelay(targetHost, targetPort, relay) {
+  const isTLS = relay.port === 443;
+  const sock = connect({ hostname: relay.host, port: relay.port, secureTransport: isTLS ? "on" : "off" });
+  const header = new TextEncoder().encode("udp:" + targetHost + ":" + targetPort);
+  const sep = new Uint8Array([0x7c]);
+  const w = sock.writable.getWriter();
+  await w.write(header);
+  await w.write(sep);
+  w.releaseLock();
+  return { readable: sock.readable, writable: sock.writable, closed: sock.closed, close: function () { sock.close(); } };
+}
+
+async function readBytes(reader, n, timeoutMs, label) {
+  const chunks = [];
+  let total = 0;
+  const deadline = Date.now() + timeoutMs;
+
+  while (total < n) {
+    const remain = deadline - Date.now();
+    if (remain <= 0) throw new Error(label + ": timeout");
+
+    const res = await Promise.race([
+      reader.read(),
+      new Promise(function (_, rej) { setTimeout(function () { rej(new Error(label + ": timeout")); }, remain); }),
+    ]);
+    if (res.done) throw new Error(label + ": closed");
+    if (!res.value || !res.value.length) continue;
+    chunks.push(res.value);
+    total += res.value.length;
   }
 
-  // Fallback lewat proxy. Proxy harus HTTP/SOCKS5 yang bisa forward, jadi
-  // pakai handshake proxy dulu (bukan tulis mentah).
-  async function retry() {
-    const parts = prxIP.split(":");
-    const fallbackIP = parts[0] || addressRemote;
-    const fallbackPort = Number(parts[1] || portRemote);
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    all.set(c, off);
+    off += c.length;
+  }
 
-    // 1) Coba lewat proxy (HTTP CONNECT / SOCKS5)
-    try {
-      const proxied = await connectViaProxy(fallbackIP, fallbackPort, addressRemote, portRemote);
-      const w = proxied.writable.getWriter();
-      await w.write(new Uint8Array(rawClientData));
-      w.releaseLock();
-      proxied.closed?.catch(() => {});
-      remoteSocketToWS(proxied, webSocket, responseHeader, null);
-      return;
-    } catch (err) {
-      console.log(`proxy gagal (${fallbackIP}:${fallbackPort}): ${err.message}`);
+  if (total > n) return { bytes: all.slice(0, n), leftover: all.slice(n) };
+  return { bytes: all, leftover: null };
+}
+
+async function readUntil(reader, needle, timeoutMs, maxBytes, label) {
+  const needleBytes = new TextEncoder().encode(needle);
+  const deadline = Date.now() + timeoutMs;
+  let buf = new Uint8Array(0);
+
+  for (;;) {
+    const idx = indexOfBytes(buf, needleBytes);
+    if (idx !== -1) {
+      const cut = idx + needleBytes.length;
+      return {
+        head: new TextDecoder().decode(buf.slice(0, cut)),
+        rest: buf.length > cut ? buf.slice(cut) : null,
+      };
     }
+    if (buf.length > maxBytes) throw new Error(label + ": header terlalu besar");
 
-    // 2) Proxy tidak bisa -> langsung ke tujuan
-    try {
-      const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-      tcpSocket.closed.catch(() => {});
-      remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
-    } catch (e2) {
-      console.log(`fallback langsung gagal: ${e2.message}`);
-      safeCloseWebSocket(webSocket);
+    const remain = deadline - Date.now();
+    if (remain <= 0) throw new Error(label + ": timeout");
+
+    const res = await Promise.race([
+      reader.read(),
+      new Promise(function (_, rej) { setTimeout(function () { rej(new Error(label + ": timeout")); }, remain); }),
+    ]);
+    if (res.done) throw new Error(label + ": closed");
+    if (!res.value || !res.value.length) continue;
+
+    const merged = new Uint8Array(buf.length + res.value.length);
+    merged.set(buf, 0);
+    merged.set(res.value, buf.length);
+    buf = merged;
+  }
+}
+
+function indexOfBytes(haystack, needle) {
+  const limit = haystack.length - needle.length;
+  for (let i = 0; i <= limit; i++) {
+    let match = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) { match = false; break; }
     }
+    if (match) return i;
   }
-
-  try {
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry);
-  } catch (err) {
-    retry();
-  }
+  return -1;
 }
 
-async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, relay) {
-  try {
-    const isTLS = relay.port === 443;
-    const tcpSocket = connect({ hostname: relay.host, port: relay.port, secureTransport: isTLS ? "on" : "off" });
-    const headerBuffer = new TextEncoder().encode(`udp:${targetAddress}:${targetPort}`);
-    const separator = new Uint8Array([0x7c]);
-    const relayMessage = new Uint8Array(headerBuffer.byteLength + separator.byteLength + dataChunk.byteLength);
+function readVlessHeader(buffer) {
+  if (!buffer || buffer.byteLength < 24) return { hasError: true, message: "terlalu pendek" };
 
-    relayMessage.set(headerBuffer, 0);
-    relayMessage.set(separator, headerBuffer.byteLength);
-    relayMessage.set(new Uint8Array(dataChunk), headerBuffer.byteLength + separator.byteLength);
+  const view = new Uint8Array(buffer);
+  const version = view[0];
+  const uuid = Array.from(view.slice(1, 17)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
 
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(relayMessage);
-    writer.releaseLock();
+  const optLength = view[17];
+  const cmd = view[18 + optLength];
+  let isUDP = false;
+  if (cmd === 2) isUDP = true;
+  else if (cmd !== 1) return { hasError: true, message: "cmd " + cmd };
 
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null);
-  } catch (error) {}
+  const portIndex = 18 + optLength + 1;
+  const portRemote = (view[portIndex] << 8) | view[portIndex + 1];
+  let i = portIndex + 2;
+  const atyp = view[i];
+  i += 1;
+
+  let addressRemote = "";
+  if (atyp === 1) {
+    addressRemote = [view[i], view[i + 1], view[i + 2], view[i + 3]].join(".");
+    i += 4;
+  } else if (atyp === 2) {
+    const len = view[i];
+    i += 1;
+    addressRemote = new TextDecoder().decode(view.slice(i, i + len));
+    i += len;
+  } else if (atyp === 3) {
+    const parts = [];
+    for (let k = 0; k < 8; k++) {
+      parts.push(((view[i + k * 2] << 8) | view[i + k * 2 + 1]).toString(16));
+    }
+    addressRemote = parts.join(":");
+    i += 16;
+  } else {
+    return { hasError: true, message: "atyp " + atyp };
+  }
+
+  return {
+    hasError: false,
+    uuid: uuid,
+    addressRemote: addressRemote,
+    portRemote: portRemote,
+    rawClientData: view.slice(i),
+    version: new Uint8Array([version, 0]),
+    isUDP: isUDP,
+  };
 }
 
-async function remoteSocketToWS(
-  remoteSocket,
-  webSocket,
-  responseHeader,
-  retry
-) {
+function isUuidAllowed(uuid, env) {
+  if (!env) return true;
+  const allowlist = env.UUID_ALLOWLIST;
+  if (!allowlist) return true;
+  const list = allowlist.split(",").map(function (u) { return u.trim().toLowerCase(); }).filter(Boolean);
+  if (!list.length) return true;
+  const hex = String(uuid || "").toLowerCase();
+  const dashed = hex.length === 32
+    ? hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20)
+    : hex;
+  return list.indexOf(hex) !== -1 || list.indexOf(dashed) !== -1;
+}
+
+async function pipeRemoteToWs(remote, webSocket, responseHeader, onNoData) {
   let header = responseHeader;
-  let hasIncomingData = false;
+  let gotData = false;
 
   try {
-    await remoteSocket.readable.pipeTo(
-      new WritableStream({
-        start() {},
-        async write(chunk, controller) {
-          hasIncomingData = true;
-          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-            controller.error("webSocket not open");
-            return;
-          }
-          if (header) {
-            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
-            header = null;
-          } else {
-            webSocket.send(chunk);
-          }
-        },
-        close() {},
-        abort(reason) {
-          console.error("remoteSocketToWS abort:", reason);
-        },
-      })
-    );
-  } catch (error) {
-    console.error("remoteSocketToWS exception:", error?.message || error);
-    safeCloseWebSocket(webSocket);
+    await remote.readable.pipeTo(new WritableStream({
+      async write(chunk) {
+        gotData = true;
+        if (webSocket.readyState !== WS_OPEN) return;
+        if (header) {
+          const merged = new Uint8Array(header.length + chunk.length);
+          merged.set(header, 0);
+          merged.set(chunk, header.length);
+          webSocket.send(merged);
+          header = null;
+        } else {
+          webSocket.send(chunk);
+        }
+      },
+      close() {},
+      abort(reason) {
+        console.log("pipe abort: " + reason);
+      },
+    }));
+  } catch (err) {
+    console.log("pipe error: " + (err && err.message));
+    safeClose(webSocket);
     return;
   }
 
-  // Tidak ada data sama sekali -> tunnel mungkin salah target, coba proxy
-  if (!hasIncomingData && retry) {
-    retry();
-  }
+  if (!gotData && onNoData) onNoData();
 }
 
-function safeCloseWebSocket(socket) {
+function safeClose(socket) {
   try {
-    if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
-      socket.close();
-    }
-  } catch (error) {}
+    if (socket.readyState === WS_OPEN || socket.readyState === WS_CLOSING) socket.close();
+  } catch (e) {}
 }
