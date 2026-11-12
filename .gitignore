@@ -5,3 +5,13 @@ node_modules/
 .env
 Thumbs.db
 .claude/
+
+# artefak Python dari tests/*.py
+__pycache__/
+*.pyc
+
+# berkas scratch berisi UUID/host VLESS nyata (jangan sampai ikut ter-commit)
+.xray-*.json
+.vless-url.txt
+.test-candidates.sh
+vless-id.yaml

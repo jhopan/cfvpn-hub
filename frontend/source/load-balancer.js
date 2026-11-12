@@ -2,8 +2,8 @@
 // Mengambil proxy hidup dari Supabase (berdasarkan Ping terbaik) dan merakit config VLESS
 
 // Narik dengan urutan latensi terendah (ping ascending)
-const SUPABASE_URL = "https://cgflrpjavyotvolnvcnl.supabase.co/rest/v1/proxy_pool?select=*&is_active=eq.true&order=ping.asc.nullslast";
-const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNnZmxycGphdnlvdHZvbG52Y25sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MjU5MTYsImV4cCI6MjEwMTUwMTkxNn0.-e9GFpQBDBQUdAYsqfu7kuUwAQaY_Mf6dc3BhUuGNmc";
+const SUPABASE_URL = "https://lumbbmhhmkcnxunuryjr.supabase.co/rest/v1/proxy_pool?select=*&is_active=eq.true&order=ping.asc.nullslast";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1bWJibWhobWtjbnh1bnVyeWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0NzI1MjEsImV4cCI6MjExMDA0ODUyMX0.ylMqMgv2H4vWax-whnXSRHBlD7DZs9DXVRUD9fAO6mc";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -66,8 +66,8 @@ async function generateSubscription(url, env) {
 
   // Ambil list worker VPN berdasarkan tier.
   // env.VPN_DOMAINS_PREM dan env.VPN_DOMAINS_FREE bisa diatur dari panel.
-  const fallbackPrem = env.VPN_DOMAINS_PREM || "vpn-prem.terabox-hub.workers.dev";
-  const fallbackFree = env.VPN_DOMAINS_FREE || "vpn-free.terabox-hub.workers.dev";
+  const fallbackPrem = env.VPN_DOMAINS_PREM || "cfvpn-vpn-prem.terabox-hub.workers.dev";
+  const fallbackFree = env.VPN_DOMAINS_FREE || "cfvpn-vpn-free.terabox-hub.workers.dev";
 
   const vpnDomainsParam = url.searchParams.get("domains") || url.searchParams.get("domain") || (tier === "PREM" ? fallbackPrem : fallbackFree);
   const domainList = vpnDomainsParam.split(",").map(d => d.trim()).filter(Boolean);

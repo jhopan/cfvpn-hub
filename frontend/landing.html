@@ -37,8 +37,8 @@
 <script>
 // Fetch public stats from Supabase (anon key, read-only)
 (async()=>{
-  const url="https://cgflrpjavyotvolnvcnl.supabase.co/rest/v1";
-  const key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNnZmxycGphdnlvdHZvbG52Y25sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MjU5MTYsImV4cCI6MjEwMTUwMTkxNn0.-e9GFpQBDBQUdAYsqfu7kuUwAQaY_Mf6dc3BhUuGNmc";
+  const url="https://lumbbmhhmkcnxunuryjr.supabase.co/rest/v1";
+  const key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1bWJibWhobWtjbnh1bnVyeWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0NzI1MjEsImV4cCI6MjExMDA0ODUyMX0.ylMqMgv2H4vWax-whnXSRHBlD7DZs9DXVRUD9fAO6mc";
   const h={"apikey":key,"Authorization":"Bearer "+key};
   try{
     const u=await fetch(url+"/users_custom?select=username",{headers:h}).then(r=>r.json());
