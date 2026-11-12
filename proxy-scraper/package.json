@@ -2,8 +2,10 @@
   "name": "proxy-scraper",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "index.mjs",
   "scripts": {
+    "scrape": "node index.mjs",
+    "scrape:dry": "node index.mjs --dry-run",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
