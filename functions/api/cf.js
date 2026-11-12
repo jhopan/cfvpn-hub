@@ -1,5 +1,7 @@
 ﻿// Deploy Worker to Cloudflare
 // POST /api/cf with { cfEmail, cfApiKey, accountId, scriptName, code, type }
+import { stripComments } from "./strip-comments.js";
+
 export async function onRequest(context) {
   if (context.request.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), {
@@ -32,10 +34,13 @@ export async function onRequest(context) {
     }
 
     // 2. Upload Worker script as ES module (multipart/form-data)
-    // Cloudflare requires multipart upload for ES module Workers
+    // Cloudflare requires multipart upload for ES module Workers.
+    // Komentar dibuang dulu: source apa adanya (dengan komentar) menghasilkan Worker yang
+    // mati beberapa saat setelah deploy (lihat functions/api/strip-comments.js).
     const boundary = "----CFVPN" + Math.random().toString(36).slice(2);
     const moduleName = scriptName + ".js";
-    
+    const uploadCode = stripComments(code);
+
     const multipartBody = [
       `--${boundary}\r\n`,
       `Content-Disposition: form-data; name="metadata"\r\n`,
@@ -44,7 +49,7 @@ export async function onRequest(context) {
       `--${boundary}\r\n`,
       `Content-Disposition: form-data; name="${moduleName}"; filename="${moduleName}"\r\n`,
       `Content-Type: application/javascript+module\r\n\r\n`,
-      code + "\r\n",
+      uploadCode + "\r\n",
       `--${boundary}--\r\n`,
     ].join("");
 
