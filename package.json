@@ -4,10 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "wrangler pages dev frontend --compatibility-date=2024-05-12",
-    "deploy": "wrangler pages deploy frontend --compatibility-date=2024-05-12"
+    "deploy": "wrangler pages deploy frontend"
   },
   "devDependencies": {
     "playwright": "^1.62.1",
+    "supabase": "^3.1.0",
     "wrangler": "latest"
   },
   "dependencies": {

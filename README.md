@@ -118,8 +118,20 @@ CREATE TABLE IF NOT EXISTS proxy_pool (
   org TEXT,
   is_active BOOLEAN DEFAULT true,
   last_checked TIMESTAMPTZ,
-  ping INTEGER
+  ping INTEGER,
+  -- bukti verifikasi dari aplikasi `proxy-scraping` (lihat catatan di bawah)
+  tls_ok BOOLEAN NOT NULL DEFAULT false,
+  alt_ok BOOLEAN NOT NULL DEFAULT false,
+  exit_ip TEXT
 );
+
+-- Catatan `is_active`: hanya verifikasi mendalam (aplikasi `proxy-scraping`) yang boleh
+-- menaikkannya. `cron-worker` hanya boleh mematikannya. Cek HTTP dangkal bisa lolos di proxy
+-- yang tidak sanggup tunnel TLS 443, sedangkan panel memakai proxy untuk WebSocket VLESS di
+-- 443 — hasilnya konfigurasi mati.
+--
+-- Skema resmi yang dipakai project aktif ada di `supabase/schema.sql`
+-- (project `lumbbmhhmkcnxunuryjr`, org "Adelia Hub"; kolom bukti + policy RLS termasuk DELETE).
 
 -- Tabel user states (workers, generated configs)
 CREATE TABLE IF NOT EXISTS user_states (

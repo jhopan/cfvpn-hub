@@ -11,6 +11,7 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import * as readline from "readline";
+import { stripComments } from "./functions/api/strip-comments.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -100,6 +101,8 @@ async function getSubdomain() {
 async function deployWorker(name, code) {
   const boundary = "----CFVPN" + Math.random().toString(36).slice(2);
   const moduleName = name + ".js";
+  // Sama seperti /api/cf: komentar dibuang sebelum upload (source apa adanya → Worker mati).
+  const uploadCode = stripComments(code);
 
   const body = [
     `--${boundary}\r\n`,
@@ -109,7 +112,7 @@ async function deployWorker(name, code) {
     `--${boundary}\r\n`,
     `Content-Disposition: form-data; name="${moduleName}"; filename="${moduleName}"\r\n`,
     `Content-Type: application/javascript+module\r\n\r\n`,
-    code + "\r\n",
+    uploadCode + "\r\n",
     `--${boundary}--\r\n`,
   ].join("");
 
