@@ -1,30 +1,28 @@
-// Relay UDP untuk CFVPN Hub — jembatan TCP -> UDP.
+// Pan VlessRelay — relay UDP untuk worker VLESS (CFVPN Hub).
 //
-// Kenapa ada: Cloudflare Workers tidak punya UDP keluar, jadi worker meneruskan datagram
-// klien (VLESS cmd=2 / XUDP) ke proses ini lewat TCP, dan proses ini yang benar-benar
-// mengirim UDP ke tujuan. Worker tetap yang menangani VLESS, DoH, dan jalur TCP.
+// Kenapa ada: Cloudflare Workers tidak punya UDP keluar. Worker meneruskan datagram UDP
+// klien (VLESS cmd=2 / XUDP) ke proses ini lewat TCP, dan proses ini yang mengirim UDP
+// nyata ke tujuan. DNS tidak perlu lewat sini (worker menjawabnya sendiri lewat DoH).
 //
-// Protokol (satu koneksi TCP = satu sesi UDP ke SATU tujuan):
-//   klien  -> relay : "udp <alamat> <port> <rahasia>\n"   (header, sekali)
-//   dua arah        : [2B panjang BE][payload]            (satu datagram per frame)
-// Balasan dari tujuan dikirim balik dengan framing yang sama. Koneksi ditutup kalau tidak
-// ada trafik selama IDLE_MS (bawaan 60 s) supaya soket UDP tidak menumpuk.
+// Protokol (TCP; satu koneksi = satu sesi UDP ke satu tujuan):
+//   klien -> relay : "udp <alamat> <port> <rahasia>\n"     (sekali, di awal)
+//   dua arah       : [2B panjang BE][payload]              (satu datagram per frame)
+//   klien -> relay : "health <rahasia>\n" -> relay balas "OK\n" lalu menutup (untuk healthcheck)
 //
-// Jalankan:
-//   RELAY_SECRET=rahasia-panjang node udp-relay.mjs                 # dengar 0.0.0.0:7300
-//   RELAY_PORT=443 RELAY_TLS=1 RELAY_CERT=fullchain.pem RELAY_KEY=privkey.pem node udp-relay.mjs
-//
-// Tanpa RELAY_SECRET proses menolak jalan (relay terbuka = alat refleksi UDP untuk siapa pun).
+// Batas protokol versi ini: 1.
 import net from "node:net";
 import tls from "node:tls";
 import dgram from "node:dgram";
 import fs from "node:fs";
+
+export const RELAY_PROTOCOL = 1;
 
 const PORT = Number(process.env.RELAY_PORT || 7300);
 const HOST = process.env.RELAY_HOST || "0.0.0.0";
 const SECRET = process.env.RELAY_SECRET || "";
 const IDLE_MS = Number(process.env.RELAY_IDLE_MS || 60000);
 const MAX_DATAGRAM = Number(process.env.RELAY_MAX_DATAGRAM || 8192);
+const HEADER_MAX = 512;
 const IDLE_SWEEP_MS = 15000;
 const USE_TLS = process.env.RELAY_TLS === "1";
 
@@ -33,9 +31,9 @@ if (!SECRET) {
   process.exit(1);
 }
 
-const stats = { connections: 0, denied: 0, datagramsIn: 0, datagramsOut: 0, errors: 0 };
+const stats = { connections: 0, denied: 0, health: 0, datagramsIn: 0, datagramsOut: 0, errors: 0 };
 
-// Satu sesi yang bermasalah tidak boleh menjatuhkan seluruh relay: catat, lalu lanjut.
+// Satu sesi bermasalah tidak boleh menjatuhkan seluruh relay: catat, lalu lanjut.
 process.on("uncaughtException", (err) => {
   stats.errors++;
   console.error("uncaught:", (err && err.message) || err);
@@ -49,7 +47,6 @@ function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
-// Satu koneksi TCP = satu sesi: soket UDP sendiri supaya balasan tujuan bisa dipetakan balik.
 function handleConnection(sock, peer) {
   stats.connections++;
   let udp = null;
@@ -67,7 +64,7 @@ function handleConnection(sock, peer) {
       udp = null;
     }
     try { sock.destroy(); } catch (e) {}
-    if (reason) log("tutup " + peer + ": " + reason);
+    if (reason && reason !== "selesai") log("tutup " + peer + ": " + reason);
   };
 
   const sendFrame = (payload) => {
@@ -77,7 +74,8 @@ function handleConnection(sock, peer) {
     stats.datagramsOut++;
   };
 
-  // Kirim satu datagram ke tujuan; kalau soket UDP belum siap, tahan dulu.
+  // Soket UDP baru bisa dipakai setelah 'listening'; datagram yang datang lebih dulu ditahan
+  // supaya tidak melempar ERR_SOCKET_DGRAM_NOT_RUNNING.
   const sendDatagram = (payload) => {
     if (!udp || !target) return;
     if (!udpReady) {
@@ -92,13 +90,11 @@ function handleConnection(sock, peer) {
     });
   };
 
-  sock.setTimeout(0);
   sock.on("error", (err) => {
     stats.errors++;
     close("error: " + err.message);
   });
   sock.on("close", () => close());
-
   sock.on("data", (chunk) => {
     lastSeen = Date.now();
     buffer = Buffer.concat([buffer, chunk]);
@@ -106,12 +102,23 @@ function handleConnection(sock, peer) {
     if (!authed) {
       const newline = buffer.indexOf(0x0a);
       if (newline === -1) {
-        if (buffer.length > 512) close("header terlalu panjang");
+        if (buffer.length > HEADER_MAX) close("header terlalu panjang");
         return;
       }
       const line = buffer.subarray(0, newline).toString("utf8").trim();
       buffer = buffer.subarray(newline + 1);
       const parts = line.split(" ");
+
+      if (parts[0] === "health") {
+        if (parts[1] !== SECRET) {
+          stats.denied++;
+          return close("rahasia salah (health)");
+        }
+        stats.health++;
+        sock.write("OK\n");
+        return close("selesai");
+      }
+
       if (parts.length !== 4 || parts[0] !== "udp") return close("header tidak dikenal");
       if (parts[3] !== SECRET) {
         stats.denied++;
@@ -130,8 +137,6 @@ function handleConnection(sock, peer) {
         if (msg.length > MAX_DATAGRAM) return;
         sendFrame(msg);
       });
-      // Soket UDP baru bisa dipakai setelah 'listening'; datagram yang datang lebih dulu
-      // ditahan supaya tidak melempar ERR_SOCKET_DGRAM_NOT_RUNNING (pernah menjatuhkan relay).
       udp.on("listening", () => {
         udpReady = true;
         while (pending.length) sendDatagram(pending.shift());
@@ -154,16 +159,16 @@ function handleConnection(sock, peer) {
 
   // Sweep idle: tanpa ini sesi yang ditinggal klien menahan soket UDP selamanya.
   const sweeper = setInterval(() => {
-    if (Date.now() - lastSeen > IDLE_MS) {
-      clearInterval(sweeper);
-      close("idle");
-    }
+    if (Date.now() - lastSeen > IDLE_MS) close("idle");
   }, IDLE_SWEEP_MS);
   sock.on("close", () => clearInterval(sweeper));
 }
 
 const server = USE_TLS
-  ? tls.createServer({ cert: fs.readFileSync(process.env.RELAY_CERT || "cert.pem"), key: fs.readFileSync(process.env.RELAY_KEY || "key.pem") }, (sock) => handleConnection(sock, sock.remoteAddress))
+  ? tls.createServer(
+      { cert: fs.readFileSync(process.env.RELAY_CERT || "cert.pem"), key: fs.readFileSync(process.env.RELAY_KEY || "key.pem") },
+      (sock) => handleConnection(sock, sock.remoteAddress)
+    )
   : net.createServer((sock) => handleConnection(sock, sock.remoteAddress));
 
 server.on("error", (err) => {
@@ -172,9 +177,17 @@ server.on("error", (err) => {
 });
 
 server.listen(PORT, HOST, () => {
-  log("relay UDP siap di " + HOST + ":" + PORT + (USE_TLS ? " (TLS)" : "") + ", idle " + IDLE_MS + " ms");
+  log("Pan VlessRelay siap di " + HOST + ":" + PORT + (USE_TLS ? " (TLS)" : "") + " | protokol " + RELAY_PROTOCOL + " | idle " + IDLE_MS + " ms");
 });
 
-setInterval(() => {
-  log("statistik: " + JSON.stringify(stats));
-}, 300000).unref();
+// Statistik berkala berguna saat dijalankan di container (docker logs).
+setInterval(() => log("statistik: " + JSON.stringify(stats)), 300000).unref();
+
+// Matikan dengan rapi supaya container berhenti tanpa meninggalkan soket menggantung.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    log("menerima " + signal + ", menutup...");
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}
