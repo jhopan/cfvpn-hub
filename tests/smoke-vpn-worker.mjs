@@ -1195,7 +1195,7 @@ async function scenarioRotatePool(port) {
   const payload = Buffer.from("PING");
   S.pool.requests = [];
   S.proxy.echoed = false;
-  const { ws, received } = await openWs("/pool", port);
+  const { ws, received } = await openWs("/ALL", port);
   ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
   const echoed = await until(() => received().length >= 8, 10000);
   const got = received();
@@ -1207,7 +1207,7 @@ async function scenarioRotatePool(port) {
   // Worker ini tidak punya FALLBACK_PROXIES, jadi echo yang sukses membuktikan proxy datang
   // dari pool. Jumlah request REST tidak diwajibkan: daftarnya di-cache 120 detik per isolate.
   return {
-    name: "Path /pool (=/rotate): proxy diambil dari pool panel",
+    name: "Path /ALL (=/rotate): proxy diambil dari pool panel",
     pass: echoed && echoOk && used >= 1 && paths.includes("rotate"),
     detail: `echo=${echoOk} rotateUsed=${used} poolReq=${S.pool.requests.length} paths=${paths}`,
   };

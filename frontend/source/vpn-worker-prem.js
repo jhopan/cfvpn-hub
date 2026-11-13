@@ -67,11 +67,11 @@ let fallbackUses = 0;
 // sebelumnya menggantung sampai CDN memutus). 0 = mati.
 const IDLE_CLOSE_DEFAULT = 180;
 
-// Path ajaib: "/rotate" (alias "/auto" dan "/pool") berarti worker MEMILIH SENDIRI proxy dari
+// Path ajaib: "/rotate" (alias "/auto", "/pool", "/ALL") berarti worker MEMILIH SENDIRI proxy dari
 // pool panel (dan daftar statis FALLBACK_PROXIES) untuk setiap koneksi baru, jadi konfigurasi
 // klien tidak perlu memuat IP proxy dan tidak perlu diganti saat pool berubah. Failover, retry,
 // dan hedge tetap berjalan di atas pilihan itu.
-const ROTATE_PATHS = ["rotate", "auto", "pool"];
+const ROTATE_PATHS = ["rotate", "auto", "pool", "all"];
 const ROTATE_POOL_LIMIT = 6; // pilih acak dari N proxy teratas (sudah urut ping)
 
 // Versi template: muncul di /health supaya panel bisa memastikan worker mana yang sudah
