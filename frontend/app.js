@@ -664,14 +664,18 @@ function renderDeploy() {
     }
   }
 
-  // Relay UDP hanya relevan untuk worker VPN; Load Balancer tidak memakainya.
+  // Relay UDP hanya untuk worker VPN **tier Premium** — Load Balancer dan tier Free tidak
+  // memasang binding relay sama sekali. Pengaman sebenarnya tetap RELAY_SECRET di relay:
+  // tanpa rahasia itu, worker mana pun tidak bisa memakai relay operator.
   const relayFields = $("relayFields");
   const typeSelect = $("deployType");
+  const tierSelectForRelay = $("deployTier");
   if (relayFields && typeSelect) {
     const syncRelayFields = () => {
-      relayFields.hidden = typeSelect.value === "load_balancer";
+      relayFields.hidden = typeSelect.value === "load_balancer" || currentDeployTier() !== "prem";
     };
     typeSelect.addEventListener("change", syncRelayFields);
+    if (tierSelectForRelay) tierSelectForRelay.addEventListener("change", syncRelayFields);
     syncRelayFields();
   }
 
@@ -710,7 +714,7 @@ function renderDeploy() {
             premOpt.disabled = true;
           }
           // Force free for non-admin
-          const tier = currentUser?.role === "admin" ? tierSelect.value : "free";
+          const tier = currentDeployTier();
           sourceUrl = tier === "prem" ? "/source/vpn-worker-prem.js" : "/source/vpn-worker-free.js";
         } else {
           sourceUrl = "/source/vpn-worker-free.js";
@@ -770,10 +774,17 @@ function renderDeploy() {
     }
   };
 }
-// Nilai relay UDP dari halaman Deploy. Hanya untuk worker VPN (Load Balancer tidak memakai
-// relay) dan hanya dikirim kalau host relay diisi — kosong berarti tidak ada binding env.
+// Tier efektif untuk deploy ini: non-admin selalu Free (sama seperti pemilihan source).
+function currentDeployTier() {
+  const select = $("deployTier");
+  return currentUser?.role === "admin" && select ? select.value : "free";
+}
+
+// Nilai relay UDP dari halaman Deploy. Hanya untuk worker VPN bertier Premium dan hanya
+// dikirim kalau host relay diisi — kosong berarti tidak ada binding env.
 function collectRelayVars(type) {
   if (type === "load_balancer") return {};
+  if (currentDeployTier() !== "prem") return {};
   const host = $("relayHost")?.value.trim() || "";
   if (!host) return {};
   return {

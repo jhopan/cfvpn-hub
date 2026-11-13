@@ -202,7 +202,28 @@ Set env vars di `cron-worker/wrangler.toml` atau Cloudflare dashboard.
 Worker Cloudflare tidak punya UDP keluar. Supaya UDP non-DNS (QUIC/HTTP3, game, WireGuard, NTP)
 tetap jalan, jalankan relay UDP sendiri (repo
 [`Pan-VlessRelay`](https://github.com/jhopan/Pan-VlessRelay), Docker siap pakai) lalu isi bagian
-**Relay UDP (opsional)** di halaman Deploy:
+**Relay UDP (opsional)** di halaman Deploy — bagian ini **khusus tier Premium** (worker VPN
+bertier Premium; user Free selalu memakai template Free tanpa binding relay).
+
+### Di mana relay bisa dijalankan
+
+Relay butuh **port TCP masuk** (worker menyambung ke situ) dan **UDP keluar** (untuk mengirim
+datagram). Itu menentukan platform yang bisa dipakai:
+
+| Platform | Relay TCP (sekarang) | Catatan |
+|---|---|---|
+| VPS biasa (IP publik) | ✅ | Paling sederhana: `docker run -p 7300:7300/tcp` |
+| **VPS NAT** (IP bersama, port dipetakan) | ✅ | Asal provider memberi **port forward TCP** + mengizinkan UDP keluar. Cek kuota bandwidth |
+| Laptop/rumah di belakang NAT | ⚠️ | Butuh terowongan TCP (mis. SSH `-L`) atau port forward router; sudah diuji lewat SSH tunnel |
+| **Render** (web service) | ❌ untuk TCP | Render tidak memberi ingress TCP publik; tapi Render **mendukung WebSocket masuk** → perlu varian relay berbasis WebSocket |
+| Railway / Fly.io | ✅ (TCP proxy) | Butuh mengaktifkan TCP proxy / service TCP |
+| **Vercel** | ❌ | Vercel Functions bersifat request/response (tanpa server TCP maupun WebSocket persisten) |
+
+Kalau hosting-mu hanya mengizinkan HTTP/WebSocket (Render, Railway tanpa TCP proxy), jalur
+yang masuk akal adalah **relay versi WebSocket** (worker menyambung via `fetch` dengan
+`Upgrade: websocket`) — belum dibuat; protokol v1 sekarang murni TCP.
+
+**Isian panel → binding Worker** (hanya dikirim untuk deploy tier Premium):
 
 | Isian panel | Menjadi binding Worker | Contoh |
 |---|---|---|
