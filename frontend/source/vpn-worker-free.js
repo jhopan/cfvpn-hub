@@ -31,16 +31,24 @@ const CORS = {
 const PROXY_HANDSHAKE_TIMEOUT = 8000;
 const MAX_HEADER_BYTES = 4096;
 
+// Cache jawaban DoH per-isolate: setiap query DNS normalnya satu subrequest fetch, dan
+// penjelajahan biasa butuh puluhan query untuk domain yang sama berulang kali. TTL dari
+// jawaban dihormati (dijepit 30..600 detik), dan entri dibatasi agar memori tidak tumbuh.
+const DNS_CACHE_TTL_MIN = 30;
+const DNS_CACHE_TTL_MAX = 600;
+const DNS_CACHE_MAX_ENTRIES = 256;
+const dnsCache = new Map();
+
 export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
 
-      if (request.headers.get("Upgrade") === "websocket") {
+      if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
         const m = url.pathname.match(/^\/(.+[:=-]\d+)$/);
         if (m) {
-          const prxIP = m[1].replace("-", ":");
-          return await websocketHandler(request, prxIP, env);
+          const prx = splitProxy(m[1]);
+          if (prx) return await websocketHandler(request, prx, env);
         }
       }
 
@@ -74,7 +82,7 @@ export default {
   },
 };
 
-async function websocketHandler(request, prxIP, env) {
+async function websocketHandler(request, prx, env) {
   const pair = new WebSocketPair();
   const client = pair[0];
   const webSocket = pair[1];
@@ -125,7 +133,7 @@ async function websocketHandler(request, prxIP, env) {
   incoming
     .pipeTo(new WritableStream({
       async write(chunk) {
-        await handleClientChunk(chunk, state, webSocket, prxIP, env);
+        await handleClientChunk(chunk, state, webSocket, prx, env);
       },
       close() {
         shutdownRemote(state, true);
@@ -142,7 +150,7 @@ async function websocketHandler(request, prxIP, env) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleClientChunk(chunk, state, webSocket, prxIP, env) {
+async function handleClientChunk(chunk, state, webSocket, prx, env) {
   if (state.remote) {
     const w = state.remote.writable.getWriter();
     try {
@@ -162,7 +170,7 @@ async function handleClientChunk(chunk, state, webSocket, prxIP, env) {
   // Byte pertama header VLESS selalu 0x00 (versi 0). Selain itu = trafik
   // non-VLESS, dilayani sebagai TCP mentah lewat proxy.
   if (bytes[0] !== 0) {
-    await openRawTunnel(bytes, webSocket, state, prxIP);
+    await openRawTunnel(bytes, webSocket, state, prx);
     return;
   }
 
@@ -196,9 +204,10 @@ async function handleClientChunk(chunk, state, webSocket, prxIP, env) {
       return;
     }
     state.versionBytes = header.version;
-    for (const message of takeDnsMessages(state, new Uint8Array(header.rawClientData))) {
-      await handleDnsQuery(message, state, webSocket, env);
-    }
+    // Beberapa query dalam satu frame dikerjakan paralel: balasan dikirim begitu siap dan
+    // klien mencocokkan lewat txid, jadi urutannya tidak penting.
+    const queries = takeDnsMessages(state, new Uint8Array(header.rawClientData));
+    await Promise.all(queries.map((message) => handleDnsQuery(message, state, webSocket, env)));
     return;
   }
 
@@ -206,7 +215,7 @@ async function handleClientChunk(chunk, state, webSocket, prxIP, env) {
   //   "cannot connect to the specified address. It looks like you might be
   //    trying to connect to a HTTP-based service - consider using fetch"
   // Jadi SEMUA koneksi harus lewat proxy, tidak ada jalur direct.
-  await tryViaProxy(header, webSocket, state, prxIP);
+  await tryViaProxy(header, webSocket, state, prx);
 }
 
 // VLESS UDP memakai framing [2B panjang BE][payload] per datagram (spesifikasi Xray),
@@ -273,33 +282,68 @@ function looksLikeDnsMessage(view) {
 
 async function handleDnsQuery(message, state, webSocket, env) {
   if (message.length < 12 || message.length > MAX_DNS_MESSAGE) return;
+
+  const key = dnsCacheKey(message);
+  if (key) {
+    const cached = readDnsCache(key);
+    if (cached) {
+      if (state.cancelled || webSocket.readyState !== WS_OPEN) return;
+      sendVlessPayload(state, webSocket, withTxid(cached, message));
+      return;
+    }
+  }
+
   let answer;
   try {
     answer = await resolveDoh(message, env);
   } catch (err) {
+    // Semua endpoint DoH gagal: balas SERVFAIL supaya klien tahu saat itu juga dan tidak
+    // menunggu timeout-nya sendiri (sebelumnya balasan tidak dikirim sama sekali).
     console.log("doh gagal: " + (err && err.message));
-    return;
+    answer = servfailResponse(message);
+    if (!answer) return;
   }
+
   if (state.cancelled || webSocket.readyState !== WS_OPEN) return;
   sendVlessPayload(state, webSocket, answer);
+  if (key) storeDnsAnswer(key, answer);
 }
 
 function sendVlessPayload(state, webSocket, payload) {
-  const parts = [];
-  if (!state.responseHeaderSent) {
-    state.responseHeaderSent = true;
-    parts.push(state.versionBytes || new Uint8Array([0, 0]));
-  }
-  if (state.udpPrefixed) parts.push(new Uint8Array([(payload.length >> 8) & 0xff, payload.length & 0xff]));
-  parts.push(payload);
+  const withHeader = !state.responseHeaderSent;
+  const version = withHeader ? (state.versionBytes || new Uint8Array([0, 0])) : null;
+  const prefixLength = state.udpPrefixed ? 2 : 0;
+  const out = new Uint8Array((version ? version.length : 0) + prefixLength + payload.length);
 
-  let out = new Uint8Array(0);
-  for (const part of parts) out = concatBytes(out, part);
+  let offset = 0;
+  if (version) {
+    state.responseHeaderSent = true;
+    out.set(version, offset);
+    offset += version.length;
+  }
+  if (prefixLength) {
+    out[offset] = (payload.length >> 8) & 0xff;
+    out[offset + 1] = payload.length & 0xff;
+    offset += 2;
+  }
+  out.set(payload, offset);
   webSocket.send(out);
 }
 
 async function resolveDoh(query, env) {
-  const endpoint = (env && env.DOH_ENDPOINT) || DOH_ENDPOINT;
+  const endpoints = dohEndpoints(env);
+  let lastError = null;
+  for (const endpoint of endpoints) {
+    try {
+      return await fetchDoh(endpoint, query);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("DoH tidak tersedia");
+}
+
+async function fetchDoh(endpoint, query) {
   const response = await withTimeout(fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/dns-message", "Accept": "application/dns-message" },
@@ -310,6 +354,121 @@ async function resolveDoh(query, env) {
   if (!answer.length) throw new Error("DoH kosong");
   if (answer.length > MAX_DNS_MESSAGE) throw new Error("DoH terlalu besar");
   return answer;
+}
+
+// Endpoint DoH yang dipakai: kalau operator menyetel env.DOH_ENDPOINT atau env.DOH_FALLBACK,
+// HANYA itu yang dipakai (dipakai uji lokal dan supaya resolver bisa dipaksa). Tanpa env,
+// pakai Cloudflare lalu Google sebagai cadangan.
+function dohEndpoints(env) {
+  const configured = [];
+  if (env) {
+    if (env.DOH_ENDPOINT) configured.push(String(env.DOH_ENDPOINT));
+    if (env.DOH_FALLBACK) configured.push(String(env.DOH_FALLBACK));
+  }
+  if (configured.length) {
+    return configured.filter(function (value, index, all) { return all.indexOf(value) === index; });
+  }
+  return [DOH_ENDPOINT, "https://dns.google/dns-query"];
+}
+
+// Kunci cache = nama + tipe + kelas pertanyaan (tanpa txid), huruf kecil dilekatkan supaya
+// "Example.com" dan "example.com" berbagi entri.
+function questionEnd(message) {
+  let i = 12;
+  while (i < message.length) {
+    const labelLength = message[i];
+    if (labelLength === 0) return i + 5 <= message.length ? i + 5 : -1;
+    if (labelLength > 63) return -1;
+    i += labelLength + 1;
+  }
+  return -1;
+}
+
+function dnsCacheKey(message) {
+  const end = questionEnd(message);
+  if (end < 12) return null;
+  let key = "";
+  for (let i = 12; i < end; i++) {
+    const byte = message[i];
+    key += String.fromCharCode(byte >= 65 && byte <= 90 ? byte + 32 : byte);
+  }
+  return key;
+}
+
+function readDnsCache(key) {
+  const entry = dnsCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) {
+    dnsCache.delete(key);
+    return null;
+  }
+  return entry.answer;
+}
+
+// Hanya jawaban sukses yang di-cache; TTL dari catatan pertama, dijepit 30..600 detik.
+function storeDnsAnswer(key, answer) {
+  if (answer.length < 12) return;
+  if ((answer[3] & 0x0f) !== 0) return; // rcode bukan 0
+  if ((answer[2] & 0x02) !== 0) return; // jawaban terpotong, jangan dipakai ulang
+  if (((answer[6] << 8) | answer[7]) < 1) return;
+  const ttl = Math.min(Math.max(minAnswerTtl(answer), DNS_CACHE_TTL_MIN), DNS_CACHE_TTL_MAX);
+  if (dnsCache.size >= DNS_CACHE_MAX_ENTRIES) {
+    const oldest = dnsCache.keys().next();
+    if (!oldest.done) dnsCache.delete(oldest.value);
+  }
+  dnsCache.set(key, { answer: answer, expires: Date.now() + ttl * 1000 });
+}
+
+// TTL terkecil di bagian answer; bagian yang tidak terbaca diabaikan (pakai 60 detik).
+function minAnswerTtl(answer) {
+  const count = (answer[6] << 8) | answer[7];
+  let i = questionEnd(answer);
+  if (i < 12) return 60;
+  let ttl = 0;
+  for (let n = 0; n < count; n++) {
+    if (i >= answer.length) break;
+    const first = answer[i];
+    if (first === 0) {
+      i += 1;
+    } else if ((first & 0xc0) === 0xc0) {
+      i += 2;
+    } else {
+      while (i < answer.length && answer[i] !== 0) i += answer[i] + 1;
+      i += 1;
+    }
+    if (i + 10 > answer.length) break;
+    const recordTtl = ((answer[i + 4] << 24) | (answer[i + 5] << 16) | (answer[i + 6] << 8) | answer[i + 7]) >>> 0;
+    const rdLength = (answer[i + 8] << 8) | answer[i + 9];
+    if (!ttl || recordTtl < ttl) ttl = recordTtl;
+    i += 10 + rdLength;
+  }
+  return ttl || 60;
+}
+
+// Jawaban cache dibuat ulang dengan txid pertanyaan baru (klien mencocokkan lewat txid).
+function withTxid(answer, query) {
+  if (answer.length < 2 || query.length < 2) return answer;
+  const out = new Uint8Array(answer);
+  out[0] = query[0];
+  out[1] = query[1];
+  return out;
+}
+
+// SERVFAIL minimal (pertanyaan dipertahankan) supaya klien gagal cepat.
+function servfailResponse(query) {
+  const end = questionEnd(query);
+  if (end < 12) return null;
+  const out = new Uint8Array(end);
+  out.set(query.subarray(0, end), 0);
+  out[2] = (query[2] | 0x80) & 0xff;
+  out[3] = (query[3] & 0xf0) | 0x02;
+  out[6] = 0;
+  out[7] = 0;
+  out[8] = 0;
+  out[9] = 0;
+  out[10] = 0;
+  out[11] = 0;
+  return out;
 }
 
 function withTimeout(promise, ms) {
@@ -325,11 +484,119 @@ function withTimeout(promise, ms) {
   });
 }
 
-async function openRawTunnel(bytes, webSocket, state, prxIP) {
-  const parts = String(prxIP).split(":");
+// Path dari klien: "/<proxy-host>-<port>" atau "/<proxy-host>:<port>". Pemisah port dibaca
+// dari kanan, jadi alamat IPv6 (yang memuat ":") juga terbaca benar.
+function splitProxy(raw) {
+  const m = /^(.*?)[:-](\d+)$/.exec(String(raw));
+  if (!m || !m[1]) return null;
+  const port = Number(m[2]);
+  if (!port || port < 1 || port > 65535) return null;
+  return { host: m[1], port: port };
+}
+
+function parseIpv4(host) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(host));
+  if (!m) return null;
+  const out = new Uint8Array(4);
+  for (let i = 1; i <= 4; i++) {
+    const value = Number(m[i]);
+    if (value > 255) return null;
+    out[i - 1] = value;
+  }
+  return out;
+}
+
+// IPv6 literal -> 16 byte; mendukung "::" dan bentuk IPv4 di ujung (mis. ::ffff:1.2.3.4).
+function parseIpv6(host) {
+  let text = String(host).trim();
+  if (text.startsWith("[") && text.endsWith("]")) text = text.slice(1, -1);
+  if (text.indexOf(":") === -1) return null;
+
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+
+  const toGroups = function (segment) {
+    const out = [];
+    if (!segment) return out;
+    for (const part of segment.split(":")) {
+      if (part === "") return null;
+      if (part.indexOf(".") !== -1) {
+        const v4 = parseIpv4(part);
+        if (!v4) return null;
+        out.push((v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]);
+        continue;
+      }
+      if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return null;
+      out.push(parseInt(part, 16));
+    }
+    return out;
+  };
+
+  const head = toGroups(halves[0]);
+  if (!head) return null;
+  let groups = head;
+  if (halves.length === 2) {
+    const tail = toGroups(halves[1]);
+    if (!tail) return null;
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return null;
+    groups = head.concat(new Array(fill).fill(0), tail);
+  }
+  if (groups.length !== 8) return null;
+
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    out[i * 2] = (groups[i] >> 8) & 0xff;
+    out[i * 2 + 1] = groups[i] & 0xff;
+  }
+  return out;
+}
+
+// IPv6 literal ditulis dalam kurung siku pada request line HTTP (RFC 7230) supaya proxy
+// tidak salah memotong host:port.
+function targetAuthority(host, port) {
+  const text = String(host);
+  const bracketed = text.indexOf(":") !== -1 && text[0] !== "[" ? "[" + text + "]" : text;
+  return bracketed + ":" + port;
+}
+
+// Permintaan CONNECT SOCKS5: tujuan berupa IP numerik dikirim sebagai ATYP 1 (IPv4) atau 4
+// (IPv6), bukan sebagai domain — proxy tidak perlu resolusi sendiri (lebih cepat, dan
+// literal IP yang dikirim sebagai domain ditolak sebagian proxy).
+function socks5Request(host, port) {
+  const ipv4 = parseIpv4(host);
+  if (ipv4) {
+    const req = new Uint8Array(10);
+    req.set([0x05, 0x01, 0x00, 0x01], 0);
+    req.set(ipv4, 4);
+    req[8] = (port >> 8) & 0xff;
+    req[9] = port & 0xff;
+    return req;
+  }
+
+  const ipv6 = parseIpv6(host);
+  if (ipv6) {
+    const req = new Uint8Array(22);
+    req.set([0x05, 0x01, 0x00, 0x04], 0);
+    req.set(ipv6, 4);
+    req[20] = (port >> 8) & 0xff;
+    req[21] = port & 0xff;
+    return req;
+  }
+
+  const hostBytes = new TextEncoder().encode(String(host));
+  const req = new Uint8Array(5 + hostBytes.length + 2);
+  req.set([0x05, 0x01, 0x00, 0x03, hostBytes.length], 0);
+  req.set(hostBytes, 5);
+  req[5 + hostBytes.length] = (port >> 8) & 0xff;
+  req[6 + hostBytes.length] = port & 0xff;
+  return req;
+}
+
+async function openRawTunnel(bytes, webSocket, state, prx) {
   const sock = connect({
-    hostname: parts[0],
-    port: Number(parts[1] || 443),
+    hostname: prx.host,
+    port: prx.port,
     secureTransport: "off",
   });
   const w = sock.writable.getWriter();
@@ -339,20 +606,19 @@ async function openRawTunnel(bytes, webSocket, state, prxIP) {
   pipeRemoteToWs(state.remote, webSocket, null);
 }
 
-async function tryViaProxy(header, webSocket, state, prxIP) {
-  const parts = String(prxIP).split(":");
-  const proxyHost = parts[0];
-  const proxyPort = Number(parts[1] || 443);
-
+async function tryViaProxy(header, webSocket, state, prx) {
   try {
     const tunnel = await openProxyTunnel(
-      proxyHost, proxyPort, header.addressRemote, header.portRemote, PROXY_HANDSHAKE_TIMEOUT
+      prx.host, prx.port, header.addressRemote, header.portRemote, PROXY_HANDSHAKE_TIMEOUT
     );
     const w = tunnel.writable.getWriter();
     await w.write(new Uint8Array(header.rawClientData));
     w.releaseLock();
     state.remote = tunnel;
-    pipeRemoteToWs(tunnel, webSocket, header.version);
+    // Header balasan VLESS (2 byte) dikirim begitu tunnel siap, bukan menunggu byte pertama
+    // dari target: target yang lama diam tidak lagi membuat klien menunggu tanpa kabar.
+    if (webSocket.readyState === WS_OPEN) webSocket.send(header.version);
+    pipeRemoteToWs(tunnel, webSocket, null);
   } catch (err) {
     console.log("proxy gagal: " + err.message);
     safeClose(webSocket);
@@ -385,13 +651,7 @@ async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeou
     if (g.bytes[0] !== 0x05) throw new Error("bukan SOCKS5");
     if (g.bytes[1] !== 0x00) throw new Error("butuh auth");
 
-    const hostBytes = new TextEncoder().encode(targetHost);
-    const req = new Uint8Array(5 + hostBytes.length + 2);
-    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-    req[4] = hostBytes.length;
-    req.set(hostBytes, 5);
-    new DataView(req.buffer).setUint16(5 + hostBytes.length, targetPort);
-    await writer.write(req);
+    await writer.write(socks5Request(targetHost, targetPort));
 
     const h = await readBytes(reader, 4, timeoutMs, "socks5-reply");
     if (h.bytes[1] !== 0x00) throw new Error("CONNECT ditolak " + h.bytes[1]);
@@ -447,8 +707,9 @@ async function httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, t
   const reader = sock.readable.getReader();
 
   try {
-    const req = "CONNECT " + targetHost + ":" + targetPort + " HTTP/1.1\r\n" +
-      "Host: " + targetHost + ":" + targetPort + "\r\n" +
+    const authority = targetAuthority(targetHost, targetPort);
+    const req = "CONNECT " + authority + " HTTP/1.1\r\n" +
+      "Host: " + authority + "\r\n" +
       "User-Agent: Mozilla/5.0\r\n\r\n";
     await writer.write(new TextEncoder().encode(req));
 
@@ -507,6 +768,22 @@ function rebuildTunnel(sock, reader, leftover, writer) {
   return { readable: readable, writable: writable, close: function () { sock.close(); } };
 }
 
+// Satu pembacaan dengan batas waktu; timernya selalu dibersihkan supaya handshake proxy
+// (yang melakukan beberapa pembacaan) tidak menumpuk timer yang menggantung.
+async function readWithTimeout(reader, ms, label) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise(function (_, reject) {
+        timer = setTimeout(function () { reject(new Error(label + ": timeout")); }, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function readBytes(reader, n, timeoutMs, label) {
   const chunks = [];
   let total = 0;
@@ -516,10 +793,7 @@ async function readBytes(reader, n, timeoutMs, label) {
     const remain = deadline - Date.now();
     if (remain <= 0) throw new Error(label + ": timeout");
 
-    const res = await Promise.race([
-      reader.read(),
-      new Promise(function (_, rej) { setTimeout(function () { rej(new Error(label + ": timeout")); }, remain); }),
-    ]);
+    const res = await readWithTimeout(reader, remain, label);
     if (res.done) throw new Error(label + ": closed");
     if (!res.value || !res.value.length) continue;
     chunks.push(res.value);
@@ -556,10 +830,7 @@ async function readUntil(reader, needle, timeoutMs, maxBytes, label) {
     const remain = deadline - Date.now();
     if (remain <= 0) throw new Error(label + ": timeout");
 
-    const res = await Promise.race([
-      reader.read(),
-      new Promise(function (_, rej) { setTimeout(function () { rej(new Error(label + ": timeout")); }, remain); }),
-    ]);
+    const res = await readWithTimeout(reader, remain, label);
     if (res.done) throw new Error(label + ": closed");
     if (!res.value || !res.value.length) continue;
 
