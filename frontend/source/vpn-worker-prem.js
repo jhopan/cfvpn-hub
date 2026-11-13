@@ -66,7 +66,7 @@ const IDLE_CLOSE_DEFAULT = 180;
 
 // Versi template: muncul di /health supaya panel bisa memastikan worker mana yang sudah
 // memakai kode terbaru.
-const WORKER_VERSION = "2026-11-13";
+const WORKER_VERSION = "2026-11-13b";
 
 // Log dibatasi per jenis pesan: hitungan tetap akurat (muncul di /health) tetapi Workers Logs
 // tidak dibanjiri ketika pool proxy sedang banyak yang mati.
@@ -84,6 +84,7 @@ const counters = {
   muxError: 0,
   udpRelayUsed: 0,
   udpRelayFail: 0,
+  proxyRetry: 0,
 };
 // Berapa baris log yang benar-benar ditulis per jenis (sisanya ditahan gate). Dibedakan dari
 // `counters` supaya efektivitas gate bisa dipantau dari /health, bukan dari logs.
@@ -688,6 +689,10 @@ function servfailResponse(query) {
   return out;
 }
 
+function sleepMs(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
 function withTimeout(promise, ms) {
   return new Promise(function (resolve, reject) {
     const timer = setTimeout(function () { reject(new Error("timeout " + ms + "ms")); }, ms);
@@ -855,6 +860,19 @@ async function tryViaProxy(header, webSocket, state, prx, env) {
     return;
   } catch (err) {
     logLimited("proxyFail", err.message + " (" + prx.host + ":" + prx.port + ")");
+    // Satu percobaan ulang ke proxy yang sama: handshake yang gagal karena paket hilang sering
+    // lolos di percobaan kedua, dan itu lebih murah daripada pindah ke cadangan. Dilewati kalau
+    // jalur cadangan sudah berjalan atau tunnel sudah terpasang.
+    if (!fallbackPromise && !state.remote) {
+      await sleepMs(180);
+      try {
+        await establishTunnel(prx, header, webSocket, state, PROXY_HANDSHAKE_TIMEOUT);
+        counters.proxyRetry++;
+        return;
+      } catch (retryErr) {
+        logLimited("proxyFail", "ulang: " + (retryErr && retryErr.message));
+      }
+    }
   } finally {
     clearTimeout(hedge);
   }

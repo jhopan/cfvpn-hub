@@ -10,7 +10,9 @@ import ssl
 import struct
 import time
 
-UUID_HEX = "14df7aee041645a8a651e69de188deca"
+# UUID default untuk worker uji; timpa lewat env VLESS_UUID kalau worker memakai
+# UUID_ALLOWLIST (worker yang dikunci hanya menerima UUID itu).
+UUID_HEX = os.environ.get("VLESS_UUID", "14df7aee041645a8a651e69de188deca").replace("-", "").lower()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) vless-test/1.0"
 
 
