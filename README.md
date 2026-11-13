@@ -197,6 +197,20 @@ Set env vars di `cron-worker/wrangler.toml` atau Cloudflare dashboard.
 
 **Batas role:** user biasa hanya mendapat Worker Free. Field versi Worker disembunyikan dan backend frontend selalu memilih `vpn-worker-free.js`. Admin dapat memilih Free atau Premium.
 
+### Memilih proxy dari path (selector)
+
+Path kedua URL WebSocket menentukan proxy mana yang dipakai worker:
+
+| Path | Arti |
+|---|---|
+| `/<ip>-<port>` atau `/<ip>:<port>` | pakai proxy itu saja (seperti sebelumnya) |
+| `/ALL`, `/ROTATE`, `/AUTO`, `/POOL` | worker memilih acak dari 6 proxy teratas pool |
+| `/ID`, `/SG`, `/ID,SG`, `/US-ID` | hanya negara itu (kode 2 huruf), pilih acak dari teratas |
+
+Enaknya: konfigurasi ber-selector tidak perlu diganti saat pool berubah, dan failover tetap
+berlaku di atas pilihan itu. Halaman **Generator** punya centang **"Mode rotasi"**: filter negara
+yang dipilih otomatis menjadi path (`/ID`, atau `/ALL` kalau tanpa filter).
+
 ## Relay UDP di Halaman Deploy
 
 Worker Cloudflare tidak punya UDP keluar. Supaya UDP non-DNS (QUIC/HTTP3, game, WireGuard, NTP)

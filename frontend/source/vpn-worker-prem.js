@@ -55,14 +55,24 @@ const BATCH_BYTES_DEFAULT = 16384;
 const BATCH_MS_DEFAULT = 2;
 const SUPABASE_URL = "https://lumbbmhhmkcnxunuryjr.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1bWJibWhobWtjbnh1bnVyeWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0NzI1MjEsImV4cCI6MjExMDA0ODUyMX0.ylMqMgv2H4vWax-whnXSRHBlD7DZs9DXVRUD9fAO6mc";
-let fallbackCache = { at: 0, list: [] };
-let fallbackFetching = null; // Promise fetch pool yang sedang jalan
+// Cache pool per-filter (kunci "all" atau "ID,SG") + fetch yang sedang jalan per kunci,
+// supaya beberapa selector tidak saling menimpa dan tetap menunggu hasil yang sama.
+const POOL_CACHE_MAX = 8;
+const poolCache = new Map();
+const poolFetching = new Map();
 let fallbackUses = 0;
 
 // Watchdog: kalau klien sudah mengirim data tapi target tidak membalas apa pun selama
 // IDLE_CLOSE_SECONDS, koneksi ditutup rapi supaya klien cepat pindah (proxy "setengah mati"
 // sebelumnya menggantung sampai CDN memutus). 0 = mati.
 const IDLE_CLOSE_DEFAULT = 180;
+
+// Path ajaib: "/rotate" (alias "/auto" dan "/pool") berarti worker MEMILIH SENDIRI proxy dari
+// pool panel (dan daftar statis FALLBACK_PROXIES) untuk setiap koneksi baru, jadi konfigurasi
+// klien tidak perlu memuat IP proxy dan tidak perlu diganti saat pool berubah. Failover, retry,
+// dan hedge tetap berjalan di atas pilihan itu.
+const ROTATE_PATHS = ["rotate", "auto", "pool"];
+const ROTATE_POOL_LIMIT = 6; // pilih acak dari N proxy teratas (sudah urut ping)
 
 // Versi template: muncul di /health supaya panel bisa memastikan worker mana yang sudah
 // memakai kode terbaru.
@@ -85,6 +95,8 @@ const counters = {
   udpRelayUsed: 0,
   udpRelayFail: 0,
   proxyRetry: 0,
+  rotateUsed: 0,
+  rotateEmpty: 0,
 };
 // Berapa baris log yang benar-benar ditulis per jenis (sisanya ditahan gate). Dibedakan dari
 // `counters` supaya efektivitas gate bisa dipantau dari /health, bukan dari logs.
@@ -114,11 +126,8 @@ export default {
       const url = new URL(request.url);
 
       if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-        const m = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-        if (m) {
-          const prx = splitProxy(m[1]);
-          if (prx) return await websocketHandler(request, prx, env);
-        }
+        const selector = parseSelector(url.pathname);
+        if (selector) return await websocketHandler(request, selector, env);
       }
 
       if (url.pathname === "/health") {
@@ -134,6 +143,8 @@ export default {
             dns_cache: dnsCache.size,
             dns_hits: { memory: dnsMemoryHits, shared: dnsSharedHits, miss: dnsCacheMisses },
             proxy_memo: proxyProtocols.size,
+            rotate_paths: ROTATE_PATHS,
+            pool_cache: Array.from(poolCache.keys()),
             version: WORKER_VERSION,
             counters: counters,
             log_emitted: logEmitted,
@@ -191,9 +202,10 @@ async function websocketHandler(request, prx, env) {
   state.cacheBase = new URL(request.url).origin;
   state.batchBytes = Number((env && env.WS_BATCH_BYTES) || BATCH_BYTES_DEFAULT);
   state.batchMs = Number((env && env.WS_BATCH_MS) || BATCH_MS_DEFAULT);
-  // Hangatkan daftar cadangan di latar belakang supaya failover tidak ikut menunggu fetch
-  // tepat saat proxy utama sudah gagal.
-  if (Date.now() - fallbackCache.at > FALLBACK_TTL_MS) {
+  // Hangatkan daftar cadangan (tanpa filter negara) di latar belakang supaya failover tidak
+  // ikut menunggu fetch tepat saat proxy utama sudah gagal.
+  const warm = poolCache.get("all");
+  if (!warm || Date.now() - warm.at > FALLBACK_TTL_MS) {
     poolFallbacks(env).catch(function () {});
   }
   // Early data: klien bisa menaruh paket pertama di header `sec-websocket-protocol` (gaya
@@ -721,6 +733,25 @@ function earlyDataValue(request) {
   return raw;
 }
 
+// Selector dari path kedua URL:
+//   /<ip>-<port> atau /<ip>:<port>   -> proxy itu saja
+//   /ALL, /ROTATE, /AUTO, /POOL      -> pilih acak dari beberapa proxy teratas di pool
+//   /ID, /SG, /ID,SG, /US-ID         -> hanya negara itu (kode 2 huruf), pilih acak dari teratas
+// Alamat IPv6 aman karena pemisah port dibaca dari kanan pada splitProxy.
+function parseSelector(rawPath) {
+  const raw = String(rawPath).replace(/^\/+/, "").trim();
+  if (!raw || raw.indexOf("/") !== -1) return null;
+
+  const upper = raw.toUpperCase();
+  if (ROTATE_PATHS.indexOf(upper.toLowerCase()) !== -1) return { rotate: true, countries: [] };
+  if (/^[A-Z]{2}([,-][A-Z]{2})*$/.test(upper)) {
+    return { rotate: true, countries: upper.split(/[,-]/) };
+  }
+  const proxy = splitProxy(raw);
+  if (proxy) return proxy;
+  return null;
+}
+
 // Path dari klien: "/<proxy-host>-<port>" atau "/<proxy-host>:<port>". Pemisah port dibaca
 // dari kanan, jadi alamat IPv6 (yang memuat ":") juga terbaca benar.
 function splitProxy(raw) {
@@ -844,6 +875,17 @@ async function openRawTunnel(bytes, webSocket, state, prx) {
 }
 
 async function tryViaProxy(header, webSocket, state, prx, env) {
+  // Mode rotate: pilih proxy dari pool (dan daftar statis) untuk koneksi ini.
+  if (prx.rotate) {
+    const chosen = await pickRotateProxy(env, prx.countries);
+    if (!chosen) {
+      logLimited("rotateEmpty", "pool kosong dan tidak ada FALLBACK_PROXIES");
+      safeClose(webSocket);
+      return;
+    }
+    counters.rotateUsed++;
+    prx = chosen;
+  }
   // Proxy utama dicoba penuh (timeout normal) supaya proxy lambat tapi sehat tetap menang.
   // Kalau belum selesai setelah HEDGE_DELAY_MS, jalur cadangan mulai berjalan paralel.
   let fallbackPromise = null;
@@ -930,6 +972,31 @@ async function runFallbacks(header, webSocket, state, env, prx) {
   return false;
 }
 
+// Proxy untuk mode rotate: gabungan pool panel + daftar statis, ambil N teratas lalu pilih acak
+// (acak, bukan round-robin, supaya beban tersebar tanpa butuh state bersama antar isolate).
+async function pickRotateProxy(env, countries) {
+  const candidates = [];
+  try {
+    for (const proxy of await poolProxies(env, countries || [])) candidates.push(proxy);
+  } catch (err) {
+    logLimited("poolFail", String(err && err.message));
+  }
+  // Daftar statis dipakai sebagai jaring terakhir (filter negara tidak berlaku untuk isinya).
+  for (const proxy of staticFallbackProxies(env)) candidates.push(proxy);
+
+  const seen = new Set();
+  const unique = [];
+  for (const proxy of candidates) {
+    const key = proxy.host + ":" + proxy.port;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(proxy);
+    if (unique.length >= ROTATE_POOL_LIMIT) break;
+  }
+  if (!unique.length) return null;
+  return unique[Math.floor(Math.random() * unique.length)];
+}
+
 function staticFallbackProxies(env) {
   const raw = env && env.FALLBACK_PROXIES;
   if (!raw) return [];
@@ -945,45 +1012,60 @@ function staticFallbackProxies(env) {
 // seperti load-balancer.js). Hasil di-cache singkat per isolate; kalau fetch sedang jalan,
 // pemanggil MENUNGGU fetch itu (bukan menerima daftar kosong) — tanpa itu koneksi pertama
 // yang gagal akan menutup sebelum daftar cadangan sempat tiba.
-async function poolFallbacks(env) {
+// Proxy dari pool panel untuk satu filter negara (kosong = semua). Cache per filter.
+// Pemanggil MENUNGGU fetch yang sedang jalan — tanpa itu koneksi pertama yang gagal menutup
+// sebelum daftar cadangan tiba.
+async function poolProxies(env, countries) {
   if (String((env && env.FALLBACK_POOL) || "") === "off") return [];
-  if (Date.now() - fallbackCache.at < FALLBACK_TTL_MS && fallbackCache.list.length) {
-    return fallbackCache.list;
-  }
-  if (!fallbackFetching) {
-    fallbackFetching = fetchPoolProxies(env).finally(function () { fallbackFetching = null; });
-  }
+  const key = countries && countries.length ? countries.join(",") : "all";
+  const cached = poolCache.get(key);
+  if (cached && Date.now() - cached.at < FALLBACK_TTL_MS && cached.list.length) return cached.list;
+
+  const running = poolFetching.get(key);
+  if (running) return await running.catch(function () { return (cached && cached.list) || []; });
+
+  const task = fetchPoolProxies(env, countries).then(function (list) {
+    if (poolCache.size >= POOL_CACHE_MAX) {
+      const oldest = poolCache.keys().next();
+      if (!oldest.done) poolCache.delete(oldest.value);
+    }
+    poolCache.set(key, { at: Date.now(), list: list });
+    return list;
+  }).finally(function () { poolFetching.delete(key); });
+  poolFetching.set(key, task);
   try {
-    return await fallbackFetching;
+    return await task;
   } catch (err) {
-    return fallbackCache.list;
+    return (cached && cached.list) || [];
   }
 }
 
-async function fetchPoolProxies(env) {
+// Jalur cadangan memakai daftar tanpa filter negara.
+async function poolFallbacks(env) {
+  return await poolProxies(env, []);
+}
+
+async function fetchPoolProxies(env, countries) {
   try {
     const fresh = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
     const base = (env && env.FALLBACK_POOL_URL) || SUPABASE_URL;
     const table = (env && env.FALLBACK_TABLE) || "proxy_pool";
-    const url = String(base).replace(/\/$/, "") + "/rest/v1/" + table +
-      "?select=ip,port&is_active=eq.true&last_checked=gt." + encodeURIComponent(fresh) +
-      "&order=ping.asc.nullslast&limit=16";
+    let url = String(base).replace(/\/$/, "") + "/rest/v1/" + table +
+      "?select=ip,port&is_active=eq.true&last_checked=gt." + encodeURIComponent(fresh);
+    if (countries && countries.length) url += "&country=in.(" + countries.join(",") + ")";
+    url += "&order=ping.asc.nullslast&limit=16";
     const res = await withTimeout(fetch(url, {
       headers: { apikey: SUPABASE_ANON_KEY, Authorization: "Bearer " + SUPABASE_ANON_KEY },
     }), FALLBACK_FETCH_TIMEOUT);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const rows = await res.json();
-    fallbackCache = {
-      at: Date.now(),
-      list: rows
-        .map(function (row) { return { host: row && row.ip, port: Number(row && row.port) }; })
-        .filter(function (proxy) { return proxy.host && proxy.port; }),
-    };
+    return rows
+      .map(function (row) { return { host: row && row.ip, port: Number(row && row.port) }; })
+      .filter(function (proxy) { return proxy.host && proxy.port; });
   } catch (err) {
     logLimited("poolFail", String(err && err.message));
-    fallbackCache = { at: Date.now(), list: fallbackCache.list };
+    return [];
   }
-  return fallbackCache.list;
 }
 
 async function fallbackCandidates(prx, env) {

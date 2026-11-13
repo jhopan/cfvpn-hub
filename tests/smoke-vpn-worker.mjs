@@ -40,6 +40,8 @@
 //  21. Semua endpoint DoH mati -> balasan SERVFAIL, bukan diam (worker kedua)
 //  22. Watchdog: target diam -> koneksi ditutup, tidak menggantung (worker IDLE_CLOSE_SECONDS=1)
 //  23. Failover pool: daftar dari proxy_pool ditunggu lalu dipakai (worker FALLBACK_POOL=on)
+//  23b. Path /rotate & /pool: worker memilih proxy sendiri (statis dan dari pool)
+//  23c. Path /SG: pool difilter negara (country=in.(SG)) sebelum dipilih acak
 //  24. Early data lewat query ?ed= tanpa mengirim pesan WS
 //  25. Protokol belum diketahui: SOCKS5 & HTTP CONNECT dicoba paralel (bukan berurutan)
 //  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
@@ -75,7 +77,7 @@ const hex = (b) => Buffer.from(b).toString("hex");
 
 const S = {
   raw: { opens: 0, all: Buffer.alloc(0) },
-  proxy: { socks5: 0, http: 0, closes: 0, connectLines: [], echoed: false, closeAfterEcho: false },
+  proxy: { socks5: 0, http: 0, closes: 0, connectLines: [], byPort: {}, echoed: false, closeAfterEcho: false },
   socks: { greeting: 0, requests: [], closes: 0, echoed: false },
   silent: { handshakes: 0 },
   pool: { requests: [] },
@@ -92,6 +94,7 @@ function reset() {
   S.proxy.http = 0;
   S.proxy.closes = 0;
   S.proxy.connectLines = [];
+  S.proxy.byPort = {};
   S.proxy.echoed = false;
   S.proxy.closeAfterEcho = false;
   S.socks.greeting = 0;
@@ -138,6 +141,7 @@ const startProxy = (port = 7302) =>
         }
         phase = "tunnel";
         S.proxy.http++;
+        S.proxy.byPort[port] = (S.proxy.byPort[port] || 0) + 1;
         S.proxy.connectLines.push(d.toString("latin1").split("\r\n")[0]);
         sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         return;
@@ -232,8 +236,10 @@ const startPoolStub = () =>
   new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       S.pool.requests.push(req.url);
+      // Jawab sesuai filter: SG -> proxy "7306", selain itu "7302" (dua-duanya stub echo).
+      const sgOnly = /country=in\.\(SG\)/.test(req.url || "");
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify([{ ip: "127.0.0.1", port: 7302 }]));
+      res.end(JSON.stringify([{ ip: "127.0.0.1", port: sgOnly ? 7306 : 7302 }]));
     });
     server.once("error", reject);
     server.listen(7309, "127.0.0.1", () => resolve(server));
@@ -1163,6 +1169,75 @@ async function scenarioUdpRelay(port, relayLog) {
   };
 }
 
+// Path ajaib "/rotate": worker memilih proxy sendiri (daftar statis FALLBACK_PROXIES).
+async function scenarioRotateStatic(port) {
+  const payload = Buffer.from("PING");
+  S.proxy.echoed = false;
+  const before = S.proxy.connectLines.length;
+  const { ws, received } = await openWs("/rotate", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+  const echoed = await until(() => received().length >= 8, 10000);
+  const got = received();
+  try { ws.close(); } catch {}
+  const lines = S.proxy.connectLines.slice(before);
+  const echoOk = got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  const used = health.counters ? health.counters.rotateUsed : -1;
+  return {
+    name: "Path /rotate: worker memilih proxy sendiri (daftar statis)",
+    pass: echoed && echoOk && used >= 1,
+    detail: `echo=${echoOk} rotateUsed=${used} connect=${JSON.stringify(lines)}`,
+  };
+}
+
+// Path ajaib "/rotate" dengan pool panel (REST proxy_pool palsu di 7309).
+async function scenarioRotatePool(port) {
+  const payload = Buffer.from("PING");
+  S.pool.requests = [];
+  S.proxy.echoed = false;
+  const { ws, received } = await openWs("/pool", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+  const echoed = await until(() => received().length >= 8, 10000);
+  const got = received();
+  try { ws.close(); } catch {}
+  const echoOk = got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  const used = health.counters ? health.counters.rotateUsed : -1;
+  const paths = Array.isArray(health.rotate_paths) ? health.rotate_paths.join(",") : "";
+  // Worker ini tidak punya FALLBACK_PROXIES, jadi echo yang sukses membuktikan proxy datang
+  // dari pool. Jumlah request REST tidak diwajibkan: daftarnya di-cache 120 detik per isolate.
+  return {
+    name: "Path /pool (=/rotate): proxy diambil dari pool panel",
+    pass: echoed && echoOk && used >= 1 && paths.includes("rotate"),
+    detail: `echo=${echoOk} rotateUsed=${used} poolReq=${S.pool.requests.length} paths=${paths}`,
+  };
+}
+
+// Path "/SG": pool difilter negara, jadi proxy yang dipakai harus berasal dari baris SG
+// (stub pool mengembalikan 7306 untuk country=in.(SG), 7302 untuk permintaan lain).
+async function scenarioRotateCountry(port) {
+  const payload = Buffer.from("PING");
+  S.pool.requests = [];
+  S.proxy.byPort = {};
+  S.proxy.echoed = false;
+  const { ws, received } = await openWs("/SG", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+  const echoed = await until(() => received().length >= 8, 12000);
+  const got = received();
+  try { ws.close(); } catch {}
+
+  const echoOk = got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  const used = health.counters ? health.counters.rotateUsed : -1;
+  const sgUsed = (S.proxy.byPort[7306] || 0) >= 1;
+  const query = S.pool.requests.find((url) => /country=in\.\(SG\)/.test(url || "")) || "";
+  return {
+    name: "Path /SG: pool difilter negara (country=in.(SG))",
+    pass: echoed && echoOk && used >= 1 && sgUsed && !!query,
+    detail: `echo=${echoOk} rotateUsed=${used} byPort=${JSON.stringify(S.proxy.byPort)} query=${JSON.stringify(String(query).slice(0, 110))}`,
+  };
+}
+
 function tierCheck() {
   const prem = fs.readFileSync(SOURCE);
   const free = fs.readFileSync(SOURCE_FREE);
@@ -1208,6 +1283,7 @@ try {
   results.push(await scenarioProxyProtocolMemo());
   results.push(await scenarioDnsCoalesce());
   results.push(await scenarioUuidBlocked());
+  results.push(await scenarioRotateStatic(PORT));
   results.push(await scenarioFailover());
   results.push(await scenarioNoFailoverWhenHealthy());
   results.push(await scenarioDnsNegativeCache());
@@ -1263,6 +1339,8 @@ try {
     throw new Error("wrangler dev (uji pool) tidak siap pada port " + PORT_POOL + "\n" + workers[3].getOut().slice(-1500));
   }
   results.push(await scenarioPoolFailover(PORT_POOL));
+  results.push(await scenarioRotatePool(PORT_POOL));
+  results.push(await scenarioRotateCountry(PORT_POOL));
 
   // Worker kelima: relay UDP (proses proxy-relay/udp-relay.mjs di atas) untuk UDP non-DNS.
   workers.push(relay); // ikut dimatikan di finally via killTree

@@ -71,6 +71,24 @@ function generateSingboxJson(configs) {
 }
 
 async function generateLocalConfigs(params) {
+  // Mode rotasi: worker yang memilih proxy sendiri (path /rotate), jadi tidak perlu daftar
+  // proxy sama sekali — satu config, dan tidak perlu diganti saat pool berubah.
+  if (params.rotate) {
+    const bound = (state.workers || []).find((w) => w.host === params.host && w.uuid);
+    const uuid = bound ? bound.uuid : crypto.randomUUID();
+    const port = params.portList[0] || "443";
+    const tls = port === "443";
+    // Filter negara yang dipilih dipakai sebagai selector path: /ID, /ID,SG, atau /ALL.
+    const country = (params.ccList && params.ccList[0]) || "";
+    const path = country ? "/" + country : "/ALL";
+    const query = new URLSearchParams({
+      encryption: "none", type: "ws", host: params.host,
+      security: tls ? "tls" : "none", sni: tls ? params.host : "", path,
+    });
+    const label = `1 CFVPN WS ${tls ? "TLS" : "NTLS"} [${country || "ALL"}] [${params.serviceName}]`;
+    return formatConfigs([`vless://${uuid}@${params.host}:${port}?${query}#${encodeURIComponent(label)}`], params.format);
+  }
+
   let proxies = [];
   
   if (params.customProxyList && params.customProxyList.length > 0) {
@@ -132,12 +150,14 @@ async function generateLocalConfigs(params) {
   }
 
   if (!configs.length) throw new Error("Proxy tidak ditemukan untuk negara pilihan.");
-  
-  if (params.format === "v2ray") return btoa(configs.join("\n"));
-  if (params.format === "raw") return configs.join("\n");
-  if (params.format === "clash") return generateClashYaml(configs);
-  if (params.format === "sfa" || params.format === "bfr") return generateSingboxJson(configs);
-  
+  return formatConfigs(configs, params.format);
+}
+
+// Formatkan daftar VLESS URI sesuai pilihan output (dipakai jalur normal maupun mode rotate).
+function formatConfigs(configs, format) {
+  if (format === "v2ray") return btoa(configs.join("\n"));
+  if (format === "clash") return generateClashYaml(configs);
+  if (format === "sfa" || format === "bfr") return generateSingboxJson(configs);
   return configs.join("\n");
 }
 
@@ -621,17 +641,20 @@ function renderGenerator() {
         if (!worker) return setMessage("formMessage", "Pilih VPN Worker aktif dulu.", true);
         const ccValue = countrySelect.value;
         const orgValue = orgSelect.value;
+        const rotate = $("rotateMode")?.checked === true;
         const specificProxy = proxySelect.value;
         let customProxyList = [];
-        if (specificProxy) {
-          customProxyList = [specificProxy];
-        } else {
-          let filtered = allProxies;
-          if (ccValue) filtered = filtered.filter(p => p.country === ccValue);
-          if (orgValue) filtered = filtered.filter(p => p.org === orgValue);
-          customProxyList = filtered.map(p => p.ip + ":" + p.port);
+        if (!rotate) {
+          if (specificProxy) {
+            customProxyList = [specificProxy];
+          } else {
+            let filtered = allProxies;
+            if (ccValue) filtered = filtered.filter(p => p.country === ccValue);
+            if (orgValue) filtered = filtered.filter(p => p.org === orgValue);
+            customProxyList = filtered.map(p => p.ip + ":" + p.port);
+          }
+          if (!customProxyList.length) throw new Error("Tidak ada proxy aktif untuk filter ini.");
         }
-        if (!customProxyList.length) throw new Error("Tidak ada proxy aktif untuk filter ini.");
         const params = {
           host: worker.host,
           serviceName: worker.host.split(".")[0],
@@ -640,7 +663,8 @@ function renderGenerator() {
           format: $("formatSelect").value,
           limit: Number($("limitInput").value),
           ccList: ccValue ? [ccValue] : [],
-          customProxyList
+          customProxyList,
+          rotate,
         };
         const content = await generateLocalConfigs(params);
         $("resultText").value = content;
