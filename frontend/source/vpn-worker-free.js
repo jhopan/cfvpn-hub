@@ -35,12 +35,35 @@ const proxyProtocols = new Map(); // per-isolate: "host:port" -> "socks5" | "htt
 const dnsInflight = new Map(); // per-isolate: kunci cache -> Promise DoH yang sedang jalan
 const MAX_HEADER_BYTES = 4096;
 
+// Failover proxy: kalau proxy di path gagal, worker mencoba cadangan (env.FALLBACK_PROXIES
+// dulu, lalu puncak tabel proxy_pool panel) supaya koneksi klien tidak langsung mati.
+// Ini BUKAN rotasi: proxy utama tetap yang dipakai selama dia sehat.
+const FALLBACK_TTL_MS = 120000;
+const FALLBACK_MAX = 3;
+const FALLBACK_FETCH_TIMEOUT = 2500;
+// Hedge: kalau proxy utama belum selesai setelah HEDGE_DELAY_MS, cadangan mulai dicoba
+// paralel; yang pertama berhasil memakai tunnel, yang kalah menutup soketnya sendiri.
+// Ini lebih baik daripada memendekkan timeout proxy utama: proxy lambat tapi sehat tetap
+// boleh menang, sedangkan proxy yang diam/mati tidak lagi menahan belasan detik.
+const HEDGE_DELAY_MS = 1500;
+const SUPABASE_URL = "https://lumbbmhhmkcnxunuryjr.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1bWJibWhobWtjbnh1bnVyeWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0NzI1MjEsImV4cCI6MjExMDA0ODUyMX0.ylMqMgv2H4vWax-whnXSRHBlD7DZs9DXVRUD9fAO6mc";
+let fallbackCache = { at: 0, list: [] };
+let fallbackFetching = null; // Promise fetch pool yang sedang jalan
+let fallbackUses = 0;
+
+// Watchdog: kalau klien sudah mengirim data tapi target tidak membalas apa pun selama
+// IDLE_CLOSE_SECONDS, koneksi ditutup rapi supaya klien cepat pindah (proxy "setengah mati"
+// sebelumnya menggantung sampai CDN memutus). 0 = mati.
+const IDLE_CLOSE_DEFAULT = 180;
+
 // Cache jawaban DoH per-isolate: setiap query DNS normalnya satu subrequest fetch, dan
 // penjelajahan biasa butuh puluhan query untuk domain yang sama berulang kali. TTL dari
 // jawaban dihormati (dijepit 30..600 detik), dan entri dibatasi agar memori tidak tumbuh.
 const DNS_CACHE_TTL_MIN = 30;
 const DNS_CACHE_TTL_MAX = 600;
 const DNS_CACHE_MAX_ENTRIES = 256;
+const DNS_NEGATIVE_TTL = 30; // NXDOMAIN/NODATA: di-cache singkat supaya tidak diulang terus
 const dnsCache = new Map();
 
 export default {
@@ -58,7 +81,18 @@ export default {
 
       if (url.pathname === "/health") {
         return new Response(
-          JSON.stringify({ ok: true, colo: request.cf?.colo, ts: Date.now() }),
+          JSON.stringify({
+            ok: true,
+            colo: request.cf?.colo,
+            ts: Date.now(),
+            // Ringkasan kondisi isolate: berguna untuk memantau dari panel tanpa logs.
+            fallback_uses: fallbackUses,
+            fallback_pool: String((env && env.FALLBACK_POOL) || "on") !== "off",
+            dns_mode: dnsCacheMode(env),
+            dns_cache: dnsCache.size,
+            dns_hits: { memory: dnsMemoryHits, shared: dnsSharedHits, miss: dnsCacheMisses },
+            proxy_memo: proxyProtocols.size,
+          }),
           { headers: { ...CORS, "Content-Type": "application/json" } }
         );
       }
@@ -92,7 +126,29 @@ async function websocketHandler(request, prx, env) {
   const webSocket = pair[1];
   webSocket.accept();
 
-  const state = { remote: null, cancelled: false, headerBuf: null, versionBytes: null, udpPrefixed: null, udpBuf: new Uint8Array(0), responseHeaderSent: false };
+  const state = {
+    remote: null,
+    remoteWriter: null,
+    cancelled: false,
+    headerBuf: null,
+    versionBytes: null,
+    udpPrefixed: null,
+    udpBuf: new Uint8Array(0),
+    responseHeaderSent: false,
+    openedAt: Date.now(),
+    lastRemoteData: 0,
+    clientSent: false,
+    idleTimer: null,
+  };
+  startIdleWatch(state, webSocket, env);
+  // Basis URL untuk Cache API (lapisan cache DNS lintas-isolate) — memakai host sendiri
+  // supaya kuncinya berada di zone ini.
+  state.cacheBase = new URL(request.url).origin;
+  // Hangatkan daftar cadangan di latar belakang supaya failover tidak ikut menunggu fetch
+  // tepat saat proxy utama sudah gagal.
+  if (Date.now() - fallbackCache.at > FALLBACK_TTL_MS) {
+    poolFallbacks(env).catch(function () {});
+  }
   const earlyData = request.headers.get("sec-websocket-protocol") || "";
 
   const incoming = new ReadableStream({
@@ -155,6 +211,7 @@ async function websocketHandler(request, prx, env) {
 }
 
 async function handleClientChunk(chunk, state, webSocket, prx, env) {
+  state.clientSent = true;
   if (state.remote) {
     await writeToRemote(state, chunk);
     return;
@@ -214,7 +271,7 @@ async function handleClientChunk(chunk, state, webSocket, prx, env) {
   //   "cannot connect to the specified address. It looks like you might be
   //    trying to connect to a HTTP-based service - consider using fetch"
   // Jadi SEMUA koneksi harus lewat proxy, tidak ada jalur direct.
-  await tryViaProxy(header, webSocket, state, prx);
+  await tryViaProxy(header, webSocket, state, prx, env);
 }
 
 // VLESS UDP memakai framing [2B panjang BE][payload] per datagram (spesifikasi Xray),
@@ -283,12 +340,27 @@ async function handleDnsQuery(message, state, webSocket, env) {
   if (message.length < 12 || message.length > MAX_DNS_MESSAGE) return;
 
   const key = dnsCacheKey(message);
-  if (key) {
-    const cached = readDnsCache(key);
-    if (cached) {
-      if (state.cancelled || webSocket.readyState !== WS_OPEN) return;
-      sendVlessPayload(state, webSocket, withTxid(cached, message));
-      return;
+  const mode = dnsCacheMode(env);
+  if (key && mode !== "off") {
+    if (mode !== "cache") {
+      const cached = readDnsCache(key);
+      if (cached) {
+        dnsMemoryHits++;
+        if (state.cancelled || webSocket.readyState !== WS_OPEN) return;
+        sendVlessPayload(state, webSocket, withTxid(cached, message));
+        return;
+      }
+    }
+    if (mode !== "memory") {
+      const shared = await readDnsCacheShared(state, key);
+      if (shared) {
+        dnsSharedHits++;
+        // Promosikan ke cache memori supaya query berikutnya tidak menyentuh Cache API.
+        storeDnsMemory(key, shared.answer, shared.ttl);
+        if (state.cancelled || webSocket.readyState !== WS_OPEN) return;
+        sendVlessPayload(state, webSocket, withTxid(shared.answer, message));
+        return;
+      }
     }
   }
 
@@ -307,7 +379,15 @@ async function handleDnsQuery(message, state, webSocket, env) {
   // Query identik yang datang bersamaan berbagi satu jawaban DoH, jadi txid disesuaikan
   // dengan pertanyaan pemanggil sebelum dikirim.
   sendVlessPayload(state, webSocket, withTxid(answer, message));
-  if (key) storeDnsAnswer(key, answer);
+
+  if (key && mode !== "off") {
+    const ttl = storeDnsAnswer(key, answer);
+    if (ttl && mode !== "memory") {
+      // Tulis Cache API tidak perlu ditunggu klien.
+      storeDnsCacheShared(state, key, answer, ttl).catch(function () {});
+    }
+  }
+  dnsCacheMisses++;
 }
 
 // Query identik yang sedang jalan berbagi satu panggilan DoH — beberapa koneksi ke domain
@@ -407,6 +487,17 @@ function dnsCacheKey(message) {
   return key;
 }
 
+let dnsMemoryHits = 0;
+let dnsSharedHits = 0;
+let dnsCacheMisses = 0;
+
+// Mode cache DNS: "both" (Map isolate + Cache API, bawaan), "memory" (hanya Map),
+// "cache" (hanya Cache API), "off".
+function dnsCacheMode(env) {
+  const mode = String((env && env.DNS_CACHE_MODE) || "both").toLowerCase();
+  return mode === "off" || mode === "memory" || mode === "cache" ? mode : "both";
+}
+
 function readDnsCache(key) {
   const entry = dnsCache.get(key);
   if (!entry) return null;
@@ -417,18 +508,58 @@ function readDnsCache(key) {
   return entry.answer;
 }
 
-// Hanya jawaban sukses yang di-cache; TTL dari catatan pertama, dijepit 30..600 detik.
-function storeDnsAnswer(key, answer) {
-  if (answer.length < 12) return;
-  if ((answer[3] & 0x0f) !== 0) return; // rcode bukan 0
-  if ((answer[2] & 0x02) !== 0) return; // jawaban terpotong, jangan dipakai ulang
-  if (((answer[6] << 8) | answer[7]) < 1) return;
-  const ttl = Math.min(Math.max(minAnswerTtl(answer), DNS_CACHE_TTL_MIN), DNS_CACHE_TTL_MAX);
+function storeDnsMemory(key, answer, ttl) {
   if (dnsCache.size >= DNS_CACHE_MAX_ENTRIES) {
     const oldest = dnsCache.keys().next();
     if (!oldest.done) dnsCache.delete(oldest.value);
   }
   dnsCache.set(key, { answer: answer, expires: Date.now() + ttl * 1000 });
+}
+
+// TTL cache: jawaban sukses memakai TTL catatan (dijepit 30..600 detik), jawaban negatif
+// (NXDOMAIN/NODATA) dipakai singkat, dan SERVFAIL/terpotong tidak di-cache sama sekali.
+function dnsCacheTtl(answer) {
+  if (answer.length < 12) return 0;
+  if ((answer[2] & 0x02) !== 0) return 0;
+  const rcode = answer[3] & 0x0f;
+  if (rcode === 2) return 0;
+  const ancount = (answer[6] << 8) | answer[7];
+  if (rcode !== 0 || ancount < 1) return DNS_NEGATIVE_TTL;
+  return Math.min(Math.max(minAnswerTtl(answer), DNS_CACHE_TTL_MIN), DNS_CACHE_TTL_MAX);
+}
+
+function storeDnsAnswer(key, answer) {
+  const ttl = dnsCacheTtl(answer);
+  if (!ttl) return 0;
+  storeDnsMemory(key, answer, ttl);
+  return ttl;
+}
+
+// --- Cache API: lapisan kedua supaya cache bertahan saat isolate didaur ulang --------------
+function dnsCacheRequest(state, key) {
+  return new Request(state.cacheBase + "/__dnscache__/" + encodeURIComponent(key), { method: "GET" });
+}
+
+async function readDnsCacheShared(state, key) {
+  try {
+    const hit = await caches.default.match(dnsCacheRequest(state, key));
+    if (!hit) return null;
+    const age = /max-age=(\d+)/.exec(hit.headers.get("Cache-Control") || "");
+    const ttl = age ? Number(age[1]) : DNS_CACHE_TTL_MIN;
+    return { answer: new Uint8Array(await hit.arrayBuffer()), ttl: Math.max(ttl, DNS_CACHE_TTL_MIN) };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function storeDnsCacheShared(state, key, answer, ttl) {
+  try {
+    await caches.default.put(dnsCacheRequest(state, key), new Response(answer, {
+      headers: { "Cache-Control": "max-age=" + ttl, "Content-Type": "application/octet-stream" },
+    }));
+  } catch (err) {
+    // Cache API bisa menolak (kuota/policy); cache memori tetap jalan.
+  }
 }
 
 // TTL terkecil di bagian answer; bagian yang tidak terbaca diabaikan (pakai 60 detik).
@@ -620,23 +751,151 @@ async function openRawTunnel(bytes, webSocket, state, prx) {
   pipeRemoteToWs(state.remote, webSocket, state);
 }
 
-async function tryViaProxy(header, webSocket, state, prx) {
+async function tryViaProxy(header, webSocket, state, prx, env) {
+  // Proxy utama dicoba penuh (timeout normal) supaya proxy lambat tapi sehat tetap menang.
+  // Kalau belum selesai setelah HEDGE_DELAY_MS, jalur cadangan mulai berjalan paralel.
+  let fallbackPromise = null;
+  const startFallbacks = function () {
+    if (!fallbackPromise) {
+      fallbackPromise = runFallbacks(header, webSocket, state, env, prx).catch(function () { return false; });
+    }
+    return fallbackPromise;
+  };
+
+  const hedge = setTimeout(startFallbacks, HEDGE_DELAY_MS);
   try {
-    const tunnel = await openProxyTunnel(
-      prx.host, prx.port, header.addressRemote, header.portRemote, PROXY_HANDSHAKE_TIMEOUT
-    );
-    const w = tunnel.writable.getWriter();
-    await w.write(new Uint8Array(header.rawClientData));
-    w.releaseLock();
-    state.remote = tunnel;
-    // Header balasan VLESS (2 byte) dikirim begitu tunnel siap, bukan menunggu byte pertama
-    // dari target: target yang lama diam tidak lagi membuat klien menunggu tanpa kabar.
-    if (webSocket.readyState === WS_OPEN) webSocket.send(header.version);
-    pipeRemoteToWs(tunnel, webSocket, state);
+    await establishTunnel(prx, header, webSocket, state, PROXY_HANDSHAKE_TIMEOUT);
+    return;
   } catch (err) {
-    console.log("proxy gagal: " + err.message);
-    safeClose(webSocket);
+    console.log("proxy gagal: " + err.message + " (" + prx.host + ":" + prx.port + ")");
+  } finally {
+    clearTimeout(hedge);
   }
+
+  if (await startFallbacks()) return;
+  safeClose(webSocket);
+}
+
+// Membuka tunnel lewat satu proxy lalu menyambungkannya ke WebSocket. Dipakai proxy utama
+// maupun cadangan supaya jalurnya identik (termasuk header balasan VLESS yang dikirim awal).
+// Tunnel pertama yang selesai "mengklaim" koneksi; percobaan lain menutup soketnya sendiri —
+// perlu karena jalur cadangan bisa berjalan paralel dengan proxy utama.
+async function establishTunnel(proxy, header, webSocket, state, timeoutMs) {
+  const tunnel = await openProxyTunnel(
+    proxy.host, proxy.port, header.addressRemote, header.portRemote, timeoutMs || PROXY_HANDSHAKE_TIMEOUT
+  );
+  if (state.remote) {
+    try { tunnel.close(); } catch (e) {}
+    throw new Error("tunnel lain sudah aktif");
+  }
+  state.remote = tunnel;
+
+  const w = tunnel.writable.getWriter();
+  await w.write(new Uint8Array(header.rawClientData));
+  w.releaseLock();
+  // Header balasan VLESS (2 byte) dikirim begitu tunnel siap, bukan menunggu byte pertama
+  // dari target: target yang lama diam tidak lagi membuat klien menunggu tanpa kabar.
+  if (webSocket.readyState === WS_OPEN) webSocket.send(header.version);
+  pipeRemoteToWs(tunnel, webSocket, state);
+}
+
+// --- failover proxy ----------------------------------------------------------------
+// Kalau proxy utama gagal (atau terlalu lama), worker mencoba cadangan: env.FALLBACK_PROXIES
+// lebih dulu, lalu puncak tabel proxy_pool panel. Ini bukan rotasi (proxy utama tetap dipakai
+// selama sehat); akibatnya IP keluar bisa berbeda dari proxy yang tertulis di path klien.
+async function runFallbacks(header, webSocket, state, env, prx) {
+  let candidates = [];
+  try {
+    candidates = await fallbackCandidates(prx, env);
+  } catch (err) {
+    console.log("daftar cadangan gagal: " + (err && err.message));
+    return false;
+  }
+  for (const candidate of candidates) {
+    if (state.remote) return true; // proxy utama ternyata menang duluan
+    try {
+      await establishTunnel(candidate, header, webSocket, state, PROXY_HANDSHAKE_TIMEOUT);
+      fallbackUses++;
+      console.log("fallback dipakai: " + candidate.host + ":" + candidate.port);
+      return true;
+    } catch (err) {
+      console.log("fallback gagal: " + candidate.host + ":" + candidate.port + " — " + err.message);
+    }
+  }
+  return false;
+}
+
+function staticFallbackProxies(env) {
+  const raw = env && env.FALLBACK_PROXIES;
+  if (!raw) return [];
+  const out = [];
+  for (const part of String(raw).split(",")) {
+    const proxy = splitProxy(part.trim());
+    if (proxy) out.push(proxy);
+  }
+  return out;
+}
+
+// Cadangan dinamis dari tabel proxy_pool panel. Anon key memang publik di repo ini (sama
+// seperti load-balancer.js). Hasil di-cache singkat per isolate; kalau fetch sedang jalan,
+// pemanggil MENUNGGU fetch itu (bukan menerima daftar kosong) — tanpa itu koneksi pertama
+// yang gagal akan menutup sebelum daftar cadangan sempat tiba.
+async function poolFallbacks(env) {
+  if (String((env && env.FALLBACK_POOL) || "") === "off") return [];
+  if (Date.now() - fallbackCache.at < FALLBACK_TTL_MS && fallbackCache.list.length) {
+    return fallbackCache.list;
+  }
+  if (!fallbackFetching) {
+    fallbackFetching = fetchPoolProxies(env).finally(function () { fallbackFetching = null; });
+  }
+  try {
+    return await fallbackFetching;
+  } catch (err) {
+    return fallbackCache.list;
+  }
+}
+
+async function fetchPoolProxies(env) {
+  try {
+    const fresh = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+    const base = (env && env.FALLBACK_POOL_URL) || SUPABASE_URL;
+    const table = (env && env.FALLBACK_TABLE) || "proxy_pool";
+    const url = String(base).replace(/\/$/, "") + "/rest/v1/" + table +
+      "?select=ip,port&is_active=eq.true&last_checked=gt." + encodeURIComponent(fresh) +
+      "&order=ping.asc.nullslast&limit=16";
+    const res = await withTimeout(fetch(url, {
+      headers: { apikey: SUPABASE_ANON_KEY, Authorization: "Bearer " + SUPABASE_ANON_KEY },
+    }), FALLBACK_FETCH_TIMEOUT);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const rows = await res.json();
+    fallbackCache = {
+      at: Date.now(),
+      list: rows
+        .map(function (row) { return { host: row && row.ip, port: Number(row && row.port) }; })
+        .filter(function (proxy) { return proxy.host && proxy.port; }),
+    };
+  } catch (err) {
+    console.log("proxy_pool gagal: " + (err && err.message));
+    fallbackCache = { at: Date.now(), list: fallbackCache.list };
+  }
+  return fallbackCache.list;
+}
+
+async function fallbackCandidates(prx, env) {
+  const seen = new Set([prx.host + ":" + prx.port]);
+  const out = [];
+  const push = function (proxy) {
+    const key = proxy.host + ":" + proxy.port;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(proxy);
+  };
+
+  for (const proxy of staticFallbackProxies(env)) push(proxy);
+  if (out.length < FALLBACK_MAX) {
+    for (const proxy of await poolFallbacks(env)) push(proxy);
+  }
+  return out.slice(0, FALLBACK_MAX);
 }
 
 async function openProxyTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
@@ -975,6 +1234,7 @@ async function pipeRemoteToWs(remote, webSocket, state) {
   try {
     await remote.readable.pipeTo(new WritableStream({
       async write(chunk) {
+        state.lastRemoteData = Date.now();
         if (webSocket.readyState !== WS_OPEN) return;
         webSocket.send(chunk);
       },
@@ -985,6 +1245,7 @@ async function pipeRemoteToWs(remote, webSocket, state) {
     }));
   } catch (err) {
     console.log("pipe error: " + (err && err.message));
+    stopIdleWatch(state);
     shutdownRemote(state, false);
     safeClose(webSocket);
     return;
@@ -992,9 +1253,35 @@ async function pipeRemoteToWs(remote, webSocket, state) {
 
   // Target sudah menutup koneksi: lepaskan state supaya potongan berikutnya dari klien tidak
   // menulis ke soket mati, lalu tutup WebSocket agar klien tidak menggantung.
+  stopIdleWatch(state);
   state.remote = null;
   state.remoteWriter = null;
   safeClose(webSocket);
+}
+
+// --- watchdog idle/half-open -------------------------------------------------------
+// Klien yang sudah mengirim data tetapi tidak pernah menerima balasan dari target (proxy
+// "setengah mati") ditutup rapi setelah IDLE_CLOSE_SECONDS; tanpa ini koneksi menggantung
+// sampai CDN yang memutus, dan klien tidak pernah pindah ke proxy lain.
+function startIdleWatch(state, webSocket, env) {
+  const seconds = Number((env && env.IDLE_CLOSE_SECONDS) || IDLE_CLOSE_DEFAULT);
+  if (!(seconds > 0)) return;
+  const limit = seconds * 1000;
+  state.idleTimer = setInterval(function () {
+    if (state.cancelled || !state.clientSent) return;
+    const last = state.lastRemoteData || state.openedAt;
+    if (Date.now() - last < limit) return;
+    console.log("watchdog: target tidak menjawab " + seconds + "s — koneksi ditutup");
+    stopIdleWatch(state);
+    shutdownRemote(state, false);
+    safeClose(webSocket, 1001, "target tidak menjawab");
+  }, Math.max(500, Math.min(limit, 15000)));
+}
+
+function stopIdleWatch(state) {
+  if (!state.idleTimer) return;
+  clearInterval(state.idleTimer);
+  state.idleTimer = null;
 }
 
 // Writer ditahan selama tunnel hidup: menghindari getWriter()/releaseLock() pada setiap
@@ -1022,8 +1309,11 @@ function shutdownRemote(state, graceful) {
   try { remote.close(); } catch (e) {}
 }
 
-function safeClose(socket) {
+function safeClose(socket, code, reason) {
   try {
-    if (socket.readyState === WS_OPEN || socket.readyState === WS_CLOSING) socket.close();
+    if (socket.readyState === WS_OPEN || socket.readyState === WS_CLOSING) {
+      if (code) socket.close(code, reason);
+      else socket.close();
+    }
   } catch (e) {}
 }
