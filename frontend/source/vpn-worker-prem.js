@@ -1,10 +1,11 @@
 // CFVPN Hub - VPN Worker (VLESS over WebSocket)
 //
 // Alur:
-//   WebSocket + path /ip:port  -> VLESS tunnel lewat proxy
+//   WebSocket + path /ip:port  -> VLESS tunnel lewat proxy (cmd=1, atau cmd=3 = mux.cool)
 //   cmd=2 port 53 (DNS)        -> dijawab worker sendiri lewat DoH, tanpa relay UDP
-//   cmd=2 port lain (UDP)      -> ditutup cepat (Workers tidak punya UDP keluar)
-//   /health                    -> health check JSON
+//   cmd=2 port lain (UDP)      -> diteruskan ke relay UDP sendiri kalau env.RELAY_SERVER_UDP
+//                                 diisi (proxy-relay/udp-relay.mjs); tanpa relay ditutup cepat
+//   /health                    -> health check JSON + hitungan isolate (version, counters)
 //   /myip                      -> info IP client
 //   HTTP biasa                 -> reverse proxy (kamuflase)
 //
@@ -81,6 +82,8 @@ const counters = {
   udpUnsupported: 0,
   dohFail: 0,
   muxError: 0,
+  udpRelayUsed: 0,
+  udpRelayFail: 0,
 };
 // Berapa baris log yang benar-benar ditulis per jenis (sisanya ditahan gate). Dibedakan dari
 // `counters` supaya efektivitas gate bisa dipantau dari /health, bukan dari logs.
@@ -219,6 +222,7 @@ async function websocketHandler(request, prx, env) {
       });
       webSocket.addEventListener("close", function () {
         stopIdleWatch(state);
+        closeUdpRelay(state);
         if (!state.cancelled) {
           try { controller.close(); } catch (err) {}
         }
@@ -226,6 +230,7 @@ async function websocketHandler(request, prx, env) {
       });
       webSocket.addEventListener("error", function () {
         stopIdleWatch(state);
+        closeUdpRelay(state);
         if (!state.cancelled) {
           try { controller.error(new Error("ws error")); } catch (err) {}
         }
@@ -235,6 +240,7 @@ async function websocketHandler(request, prx, env) {
     cancel() {
       state.cancelled = true;
       stopIdleWatch(state);
+      closeUdpRelay(state);
       shutdownRemote(state, false);
     },
   });
@@ -312,14 +318,20 @@ async function handleClientChunk(chunk, state, webSocket, prx, env) {
   }
 
   if (header.isUDP) {
+    state.versionBytes = header.version;
     if (header.portRemote !== 53) {
-      // Workers tidak punya UDP keluar, dan relay UDP eksternal sudah tidak tersedia,
-      // jadi UDP selain DNS ditutup cepat dengan alasan yang jelas (bukan menggantung).
-      logLimited("udpUnsupported", "port " + header.portRemote + " tidak didukung");
+      // UDP non-DNS: diteruskan ke relay (env.RELAY_SERVER_UDP) kalau ada. Tanpa relay,
+      // perilakunya tetap seperti sebelumnya: ditutup cepat dengan alasan yang jelas.
+      if (await udpRelayEnsure(state, webSocket, env, header)) {
+        for (const datagram of splitUdpDatagrams(state, new Uint8Array(header.rawClientData))) {
+          udpRelaySend(state, datagram);
+        }
+        return;
+      }
+      logLimited("udpUnsupported", "port " + header.portRemote + " tanpa relay UDP");
       safeClose(webSocket);
       return;
     }
-    state.versionBytes = header.version;
     // Beberapa query dalam satu frame dikerjakan paralel: balasan dikirim begitu siap dan
     // klien mencocokkan lewat txid, jadi urutannya tidak penting.
     const queries = takeDnsMessages(state, new Uint8Array(header.rawClientData));
@@ -1613,6 +1625,121 @@ async function muxUdpQuery(state, webSocket, env, id, frame, data) {
   }
 }
 
+// --- relay UDP opsional (proxy-relay/udp-relay.mjs) ---------------------------------
+// Workers tidak punya UDP keluar, jadi datagram UDP non-DNS bisa diteruskan ke proses relay
+// milik sendiri lewat TCP: "udp <alamat> <port> <rahasia>\n" lalu [2B panjang][payload]
+// dua arah. Tanpa env.RELAY_SERVER_UDP perilakunya tetap seperti sebelumnya (tutup cepat).
+const MAX_UDP_DATAGRAM = 8192;
+
+function udpRelayConfig(env) {
+  const host = env && env.RELAY_SERVER_UDP;
+  if (!host) return null;
+  return {
+    host: String(host),
+    port: Number((env && env.RELAY_SERVER_PORT) || 7300),
+    tls: String((env && env.RELAY_SERVER_TLS) || "") === "1",
+    secret: String((env && env.RELAY_SECRET) || ""),
+  };
+}
+
+async function udpRelayEnsure(state, webSocket, env, header) {
+  if (state.udpRelay) return true;
+  const relay = udpRelayConfig(env);
+  if (!relay) return false;
+  if (!relay.secret) {
+    logLimited("udpRelayFail", "RELAY_SECRET belum diisi");
+    return false;
+  }
+  try {
+    const sock = connect({ hostname: relay.host, port: relay.port, secureTransport: relay.tls ? "on" : "off" });
+    const writer = sock.writable.getWriter();
+    await writer.write(new TextEncoder().encode(
+      "udp " + header.addressRemote + " " + header.portRemote + " " + relay.secret + "\n"
+    ));
+    state.udpPrefixed = true; // relay memakai framing berpanjang seperti VLESS UDP
+    state.udpRelay = { sock: sock, writer: writer };
+    udpRelayPipe(state, webSocket, sock);
+    counters.udpRelayUsed++;
+    return true;
+  } catch (err) {
+    logLimited("udpRelayFail", String(err && err.message));
+    return false;
+  }
+}
+
+function udpRelaySend(state, payload) {
+  const relay = state.udpRelay;
+  if (!relay || state.cancelled) return;
+  const frame = new Uint8Array(2 + payload.length);
+  frame[0] = (payload.length >> 8) & 0xff;
+  frame[1] = payload.length & 0xff;
+  frame.set(payload, 2);
+  relay.writer.write(frame).catch(function (err) {
+    logLimited("udpRelayFail", String(err && err.message));
+  });
+}
+
+// Balasan relay -> datagram VLESS UDP ke klien (header 2 byte + [2B panjang][datagram]).
+function udpRelayPipe(state, webSocket, sock) {
+  let buf = new Uint8Array(0);
+  sock.readable
+    .pipeTo(new WritableStream({
+      write(chunk) {
+        state.lastRemoteData = Date.now();
+        buf = concatBytes(buf, toBytes(chunk));
+        for (;;) {
+          if (buf.length < 2) return;
+          const length = (buf[0] << 8) | buf[1];
+          if (!length || length > MAX_UDP_DATAGRAM) {
+            buf = new Uint8Array(0);
+            return;
+          }
+          if (buf.length < 2 + length) return;
+          const payload = buf.subarray(2, 2 + length);
+          buf = buf.subarray(2 + length);
+          if (webSocket.readyState === WS_OPEN) sendVlessPayload(state, webSocket, payload);
+        }
+      },
+      close() {},
+      abort() {},
+    }))
+    .catch(function (err) {
+      logLimited("udpRelayFail", String(err && err.message));
+    })
+    .then(function () {
+      closeUdpRelay(state);
+    });
+}
+
+// Datagram dari klien: framing [2B panjang][payload]; kalau dua byte pertama bukan panjang yang
+// masuk akal, seluruh buffer dianggap satu datagram polos (sebagian klien mengirim begitu).
+// Buffer-nya terpisah dari jalur DNS supaya keduanya bisa hidup di koneksi yang sama.
+function splitUdpDatagrams(state, bytes) {
+  state.udpRelayBuf = concatBytes(state.udpRelayBuf || new Uint8Array(0), bytes);
+  const out = [];
+  for (;;) {
+    if (state.udpRelayBuf.length < 2) break;
+    const length = (state.udpRelayBuf[0] << 8) | state.udpRelayBuf[1];
+    if (!length || length > MAX_UDP_DATAGRAM) {
+      if (state.udpRelayBuf.length) out.push(state.udpRelayBuf);
+      state.udpRelayBuf = new Uint8Array(0);
+      break;
+    }
+    if (state.udpRelayBuf.length < 2 + length) break;
+    out.push(state.udpRelayBuf.subarray(2, 2 + length));
+    state.udpRelayBuf = state.udpRelayBuf.subarray(2 + length);
+  }
+  return out;
+}
+
+function closeUdpRelay(state) {
+  const relay = state.udpRelay;
+  if (!relay) return;
+  state.udpRelay = null;
+  try { relay.writer.releaseLock(); } catch (e) {}
+  try { relay.sock.close(); } catch (e) {}
+}
+
 function toBytes(chunk) {
   if (typeof chunk === "string") return new TextEncoder().encode(chunk);
   if (chunk instanceof Uint8Array) return chunk;
@@ -1729,6 +1856,7 @@ function startIdleWatch(state, webSocket, env) {
     if (Date.now() - last < limit) return;
     logLimited("watchdog", "target tidak menjawab " + seconds + "s — koneksi ditutup");
     stopIdleWatch(state);
+    closeUdpRelay(state);
     shutdownRemote(state, false);
     safeClose(webSocket, 1001, "target tidak menjawab");
   }, Math.max(500, Math.min(limit, 15000)));

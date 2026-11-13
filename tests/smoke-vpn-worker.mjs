@@ -49,6 +49,7 @@
 // Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+3).
 import net from "node:net";
 import http from "node:http";
+import dgram from "node:dgram";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -63,6 +64,7 @@ const PORT = Number(process.env.SMOKE_PORT || 8787);
 const PORT_DOH = PORT + 1;
 const PORT_IDLE = PORT + 2;
 const PORT_POOL = PORT + 3;
+const PORT_RELAY = PORT + 4;
 // Target IPv6 tetap untuk uji (2001:db8::1) — ditulis apa adanya supaya uji tidak memakai
 // parser yang sedang diuji.
 const IPV6_TARGET = "2001:db8::1";
@@ -78,6 +80,7 @@ const S = {
   silent: { handshakes: 0 },
   pool: { requests: [] },
   race: { socksSilent: 0, http: 0, closes: 0, echoed: false },
+  udp: { messages: 0, last: "" },
   stream: { chunks: 0, }, 
   doh: { requests: [], answers: 0, answerLength: 0 },
 };
@@ -318,6 +321,30 @@ const startStreamProxy = () =>
       }, 1);
     });
   });
+
+// --- uji relay UDP: UDP echo + proses relay asli (proxy-relay/udp-relay.mjs) -------------
+const startUdpEcho = () =>
+  new Promise((resolve, reject) => {
+    const sock = dgram.createSocket("udp4");
+    sock.on("error", reject);
+    sock.on("message", (msg, from) => {
+      S.udp.messages++;
+      S.udp.last = msg.toString("utf8");
+      sock.send(Buffer.concat([Buffer.from("UDP:"), msg]), from.port, from.address);
+    });
+    sock.bind(7314, "127.0.0.1", () => resolve(sock));
+  });
+
+function startRelay() {
+  const child = spawn(process.execPath, [path.join(ROOT, "proxy-relay", "udp-relay.mjs")], {
+    env: { ...process.env, RELAY_HOST: "127.0.0.1", RELAY_PORT: "7313", RELAY_SECRET: "uji", RELAY_IDLE_MS: "5000" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", (d) => { out += d.toString(); });
+  child.stderr.on("data", (d) => { out += d.toString(); });
+  return { child, getOut: () => out };
+}
 
 const startDoh = () =>
   new Promise((resolve, reject) => {
@@ -1106,6 +1133,36 @@ function parseMuxFrames(buf) {
   return { frames: frames, rest: buf.subarray(offset) };
 }
 
+// UDP non-DNS lewat relay: worker -> relay (TCP) -> UDP echo -> balik lagi sebagai datagram VLESS.
+async function scenarioUdpRelay(port, relayLog) {
+  S.udp.messages = 0;
+  S.udp.last = "";
+  const payload = Buffer.from("PINGUDP");
+  const datagram = prefixed(payload);
+  const { ws, received } = await openWs("/127.0.0.1:7302", port);
+  ws.send(frame({ cmd: 2, host: "127.0.0.1", port: 7314, payload: datagram }));
+
+  const answered = await until(() => {
+    const got = received();
+    if (got.length < 4) return false;
+    const len = (got[2] << 8) | got[3];
+    return got.length >= 4 + len;
+  }, 10000);
+  await until(() => false, 300);
+  const got = received();
+  const len = got.length >= 4 ? (got[2] << 8) | got[3] : 0;
+  const answer = got.subarray(4, 4 + len).toString("utf8");
+  try { ws.close(); } catch {}
+
+  const headerOk = got.length >= 2 && got[0] === 0x00 && got[1] === 0x00;
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  return {
+    name: "UDP non-DNS lewat relay (worker -> relay TCP -> UDP)",
+    pass: answered && headerOk && answer === "UDP:PINGUDP" && S.udp.messages >= 1,
+    detail: `jawaban=${JSON.stringify(answer)} header=${headerOk} udpEcho=${S.udp.messages} counters=${JSON.stringify(health.counters)} logRelay=${JSON.stringify((relayLog() || "").slice(-200))}`,
+  };
+}
+
 function tierCheck() {
   const prem = fs.readFileSync(SOURCE);
   const free = fs.readFileSync(SOURCE_FREE);
@@ -1120,7 +1177,9 @@ const workers = [];
 try {
   if (!fs.existsSync(WRANGLER)) throw new Error(`wrangler tidak ada di ${WRANGLER} — jalankan npm install dulu`);
   const dohStub = await startDoh();
-  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startSocks(), await startSilentProxy(), await startRaceProxy(), await startStreamProxy(), await startPoolStub(), dohStub);
+  const udpEcho = await startUdpEcho();
+  const relay = startRelay();
+  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startSocks(), await startSilentProxy(), await startRaceProxy(), await startStreamProxy(), await startPoolStub(), udpEcho, dohStub);
 
   workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-")));
   makeFixture(workdirs[0], {
@@ -1204,6 +1263,25 @@ try {
     throw new Error("wrangler dev (uji pool) tidak siap pada port " + PORT_POOL + "\n" + workers[3].getOut().slice(-1500));
   }
   results.push(await scenarioPoolFailover(PORT_POOL));
+
+  // Worker kelima: relay UDP (proses proxy-relay/udp-relay.mjs di atas) untuk UDP non-DNS.
+  workers.push(relay); // ikut dimatikan di finally via killTree
+  if (!(await waitPort(7313, 30000))) {
+    throw new Error("relay UDP tidak siap di port 7313\n" + relay.getOut().slice(-800));
+  }
+  workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-relay-")));
+  makeFixture(workdirs[4], {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    RELAY_SERVER_UDP: "127.0.0.1",
+    RELAY_SERVER_PORT: "7313",
+    RELAY_SECRET: "uji",
+    FALLBACK_POOL: "off",
+  });
+  workers.push(startWorker(workdirs[4], PORT_RELAY));
+  if (!(await waitPort(PORT_RELAY, 120000))) {
+    throw new Error("wrangler dev (uji relay UDP) tidak siap pada port " + PORT_RELAY + "\n" + workers[workers.length - 1].getOut().slice(-1500));
+  }
+  results.push(await scenarioUdpRelay(PORT_RELAY, () => relay.getOut()));
 
   results.push(tierCheck());
 } catch (err) {
