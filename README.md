@@ -208,7 +208,11 @@ Path kedua URL WebSocket menentukan proxy mana yang dipakai worker:
 | `/ID`, `/SG`, `/ID,SG`, `/US-ID` | hanya negara itu (kode 2 huruf), pilih acak dari teratas |
 
 Enaknya: konfigurasi ber-selector tidak perlu diganti saat pool berubah, dan failover tetap
-berlaku di atas pilihan itu. Halaman **Generator** punya centang **"Mode rotasi"**: filter negara
+berlaku di atas pilihan itu.
+
+Kalau memakai filter negara, worker **gagal-tertutup**: saat negara itu sedang tidak punya proxy
+sehat, koneksi ditutup — bukan diam-diam keluar lewat proxy negara lain. Longgarkan dengan
+beberapa negara (`/ID,SG`) atau pakai `/ALL` kalau negara keluar tidak penting. Halaman **Generator** punya centang **"Mode rotasi"**: filter negara
 yang dipilih otomatis menjadi path (`/ID`, atau `/ALL` kalau tanpa filter).
 
 ## Relay UDP di Halaman Deploy

@@ -42,6 +42,7 @@
 //  23. Failover pool: daftar dari proxy_pool ditunggu lalu dipakai (worker FALLBACK_POOL=on)
 //  23b. Path /rotate & /pool: worker memilih proxy sendiri (statis dan dari pool)
 //  23c. Path /SG: pool difilter negara (country=in.(SG)) sebelum dipilih acak
+//  23d. Path /XX: selector negara gagal-tertutup, bukan pindah ke proxy negara lain
 //  24. Early data lewat query ?ed= tanpa mengirim pesan WS
 //  25. Protokol belum diketahui: SOCKS5 & HTTP CONNECT dicoba paralel (bukan berurutan)
 //  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
@@ -236,10 +237,14 @@ const startPoolStub = () =>
   new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       S.pool.requests.push(req.url);
-      // Jawab sesuai filter: SG -> proxy "7306", selain itu "7302" (dua-duanya stub echo).
-      const sgOnly = /country=in\.\(SG\)/.test(req.url || "");
+      // Jawab sesuai filter: tanpa filter -> "7302", SG -> "7306", negara lain -> kosong.
+      // Yang kosong dipakai untuk membuktikan selector negara gagal-tertutup.
+      const filter = ((req.url || "").match(/country=in\.\(([^)]*)\)/) || [])[1];
+      const rows = filter
+        ? (/SG/.test(filter) ? [{ ip: "127.0.0.1", port: 7306 }] : [])
+        : [{ ip: "127.0.0.1", port: 7302 }];
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify([{ ip: "127.0.0.1", port: sgOnly ? 7306 : 7302 }]));
+      res.end(JSON.stringify(rows));
     });
     server.once("error", reject);
     server.listen(7309, "127.0.0.1", () => resolve(server));
@@ -1006,9 +1011,14 @@ async function scenarioBatching(port, expectBatched) {
   const count = messages();
   try { ws.close(); } catch {}
 
-  const pass = bytes === total && (expectBatched ? count <= 14 : count >= 15);
+  // Ambang absolut (count >= 15) rapuh: workerd boleh menggabungkan beberapa tulis 1 ms jadi
+  // satu read, jadi jumlah pesan WS bisa kecil di kedua worker. Yang deterministik adalah
+  // arahnya - batching hanya bisa MENGGABUNG pesan, tidak menambah - jadi worker yang batching
+  // mati tidak boleh mengirim lebih sedikit pesan daripada worker yang batching hidup.
+  const pass = bytes === total && (expectBatched ? count <= 14 : count >= Math.max(2, S.batchOnCount || 0));
+  if (expectBatched) S.batchOnCount = count;
   return {
-    name: expectBatched ? "Batching WS aktif: potongan digabung" : "Batching dimatikan (WS_BATCH_MS=0): satu pesan per potongan",
+    name: expectBatched ? "Batching WS aktif: potongan digabung" : "Batching dimatikan (WS_BATCH_MS=0): satu pesan per potongan (pembanding)",
     pass: pass,
     detail: `pesan=${count} byte=${bytes} (harap ${total})`,
   };
@@ -1238,6 +1248,35 @@ async function scenarioRotateCountry(port) {
   };
 }
 
+// Path "/XX": pool tidak punya baris XX, dan daftar statis tidak boleh dipakai untuk selector
+// negara -> worker harus gagal-tertutup (tidak ada data sama sekali), bukan menyambung lewat
+// proxy negara lain. byPort harus tetap kosong: tidak ada tipe proxy yang dihubungi.
+async function scenarioCountryClosed(port) {
+  const payload = Buffer.from("PING");
+  S.pool.requests = [];
+  S.proxy.byPort = {};
+  S.proxy.echoed = false;
+  const healthOf = async () => await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  const before = await healthOf();
+  const { ws, received } = await openWs("/XX", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+  const echoed = await until(() => received().length > 0, 6000);
+  const got = received();
+  try { ws.close(); } catch {}
+  const after = await healthOf();
+
+  const delta = (key) => Number((after.counters || {})[key] || 0) - Number((before.counters || {})[key] || 0);
+  const empty = delta("rotateEmpty");
+  const used = delta("rotateUsed");
+  const touched = Object.keys(S.proxy.byPort).length;
+  const query = S.pool.requests.find((u) => /country=in\.\(XX\)/.test(u || "")) || "";
+  return {
+    name: "Path /XX: selector negara gagal-tertutup (tanpa cadangan lintas negara)",
+    pass: !echoed && got.length === 0 && empty >= 1 && used === 0 && touched === 0 && !!query,
+    detail: `echo=${echoed} bytes=${got.length} rotateEmpty=+${empty} rotateUsed=+${used} proxyDihubungi=${touched} query=${JSON.stringify(String(query).slice(0, 90))}`,
+  };
+}
+
 function tierCheck() {
   const prem = fs.readFileSync(SOURCE);
   const free = fs.readFileSync(SOURCE_FREE);
@@ -1341,6 +1380,7 @@ try {
   results.push(await scenarioPoolFailover(PORT_POOL));
   results.push(await scenarioRotatePool(PORT_POOL));
   results.push(await scenarioRotateCountry(PORT_POOL));
+  results.push(await scenarioCountryClosed(PORT_POOL));
 
   // Worker kelima: relay UDP (proses proxy-relay/udp-relay.mjs di atas) untuk UDP non-DNS.
   workers.push(relay); // ikut dimatikan di finally via killTree

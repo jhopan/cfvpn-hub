@@ -11,6 +11,7 @@ berhasil membuat tunnel SOCKS5/HTTP CONNECT ke proxy itu.
 """
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +23,9 @@ REQUEST = b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n"
 
 
 def check(host, prx, timeout=8.0):
-    path = f"/{prx.replace(':', '-')}"
+    # VLESS_PATH menimpa path per-kandidat: dipakai untuk menguji selector worker (/ID, /ALL)
+    # yang memilih proxy sendiri, bukan proxy yang tertulis di path.
+    path = os.environ.get("VLESS_PATH") or f"/{prx.replace(':', '-')}"
     started = time.time()
     ws = None
     try:

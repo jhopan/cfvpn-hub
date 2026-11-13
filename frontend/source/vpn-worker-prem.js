@@ -879,7 +879,8 @@ async function tryViaProxy(header, webSocket, state, prx, env) {
   if (prx.rotate) {
     const chosen = await pickRotateProxy(env, prx.countries);
     if (!chosen) {
-      logLimited("rotateEmpty", "pool kosong dan tidak ada FALLBACK_PROXIES");
+      counters.rotateEmpty++;
+      logLimited("rotateEmpty", "tidak ada kandidat proxy untuk selector " + (prx.countries && prx.countries.length ? prx.countries.join(",") : "pool"));
       safeClose(webSocket);
       return;
     }
@@ -981,8 +982,11 @@ async function pickRotateProxy(env, countries) {
   } catch (err) {
     logLimited("poolFail", String(err && err.message));
   }
-  // Daftar statis dipakai sebagai jaring terakhir (filter negara tidak berlaku untuk isinya).
-  for (const proxy of staticFallbackProxies(env)) candidates.push(proxy);
+  // Daftar statis (tanpa label negara) hanya dipakai kalau klien tidak memfilter negara:
+  // untuk /ID, memakai proxy statis berarti keluar dari negara lain tanpa bilang.
+  if (!(countries && countries.length)) {
+    for (const proxy of staticFallbackProxies(env)) candidates.push(proxy);
+  }
 
   const seen = new Set();
   const unique = [];
@@ -1078,9 +1082,16 @@ async function fallbackCandidates(prx, env) {
     out.push(proxy);
   };
 
-  for (const proxy of staticFallbackProxies(env)) push(proxy);
+  // Selector negara TIDAK boleh diselamatkan proxy negara lain: kalau klien minta /ID, keluar
+  // dari NL diam-diam lebih buruk daripada gagal (IP keluar adalah alasan filter itu dipakai).
+  // Jadi daftar statis (tanpa label negara) dan pool tanpa filter hanya dipakai saat tidak ada
+  // filter negara; dengan filter, kandidat cadangan ikut difilter.
+  const countries = (prx && prx.countries) || [];
+  if (!countries.length) {
+    for (const proxy of staticFallbackProxies(env)) push(proxy);
+  }
   if (out.length < FALLBACK_MAX) {
-    for (const proxy of await poolFallbacks(env)) push(proxy);
+    for (const proxy of await poolProxies(env, countries)) push(proxy);
   }
   return out.slice(0, FALLBACK_MAX);
 }
