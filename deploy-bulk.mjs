@@ -98,17 +98,39 @@ async function getSubdomain() {
   }
 }
 
+// Binding relay UDP untuk Worker yang di-deploy bulk, aktif kalau RELAY_SERVER_UDP diisi di
+// lingkungan shell (nama env-nya sengaja sama dengan nama binding di Worker).
+function relayBindings() {
+  const host = (process.env.RELAY_SERVER_UDP || "").trim();
+  if (!host) return [];
+  const secret = (process.env.RELAY_SECRET || "").trim();
+  if (!secret) {
+    throw new Error("RELAY_SERVER_UDP diisi tapi RELAY_SECRET kosong — relay akan menolak sambungan.");
+  }
+  return [
+    { type: "plain_text", name: "RELAY_SERVER_UDP", text: host },
+    { type: "plain_text", name: "RELAY_SERVER_PORT", text: (process.env.RELAY_SERVER_PORT || "7300").trim() },
+    { type: "plain_text", name: "RELAY_SERVER_TLS", text: (process.env.RELAY_SERVER_TLS || "").trim() },
+    { type: "plain_text", name: "RELAY_SECRET", text: secret },
+  ].filter((binding) => binding.text);
+}
+
 async function deployWorker(name, code) {
   const boundary = "----CFVPN" + Math.random().toString(36).slice(2);
   const moduleName = name + ".js";
   // Sama seperti /api/cf: komentar dibuang sebelum upload (source apa adanya → Worker mati).
   const uploadCode = stripComments(code);
+  const bindings = relayBindings();
 
   const body = [
     `--${boundary}\r\n`,
     `Content-Disposition: form-data; name="metadata"\r\n`,
     `Content-Type: application/json\r\n\r\n`,
-    JSON.stringify({ main_module: moduleName, compatibility_date: "2024-05-12" }) + "\r\n",
+    JSON.stringify({
+      main_module: moduleName,
+      compatibility_date: "2024-05-12",
+      ...(bindings.length ? { bindings } : {}),
+    }) + "\r\n",
     `--${boundary}\r\n`,
     `Content-Disposition: form-data; name="${moduleName}"; filename="${moduleName}"\r\n`,
     `Content-Type: application/javascript+module\r\n\r\n`,

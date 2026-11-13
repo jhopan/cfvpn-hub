@@ -664,6 +664,17 @@ function renderDeploy() {
     }
   }
 
+  // Relay UDP hanya relevan untuk worker VPN; Load Balancer tidak memakainya.
+  const relayFields = $("relayFields");
+  const typeSelect = $("deployType");
+  if (relayFields && typeSelect) {
+    const syncRelayFields = () => {
+      relayFields.hidden = typeSelect.value === "load_balancer";
+    };
+    typeSelect.addEventListener("change", syncRelayFields);
+    syncRelayFields();
+  }
+
   $("deployForm").onsubmit = async (event) => { 
     event.preventDefault(); 
     const type = $("deployType").value; 
@@ -672,6 +683,12 @@ function renderDeploy() {
     const cfApiKey = $("cfApiKey").value.trim();
     const cfEmail = $("cfEmail").value.trim();
     const accountId = $("cfAccountId").value.trim();
+
+    // Relay tanpa rahasia akan ditolak relay-nya sendiri, jadi cegah di sini.
+    if (($("relayHost")?.value.trim() || "") && !($("relaySecret")?.value.trim() || "")) {
+      setMessage("deployMessage", "Rahasia relay wajib diisi kalau host relay diisi.", true);
+      return;
+    }
 
     $("startDeployBtn").disabled = true;
     setMessage("deployMessage", "Mengambil source code worker...");
@@ -715,7 +732,8 @@ function renderDeploy() {
           accountId,
           scriptName: name,
           code,
-          type
+          type,
+          vars: collectRelayVars(type),
         })
       });
 
@@ -725,7 +743,10 @@ function renderDeploy() {
         throw new Error(deployData.error || "Deploy gagal: " + JSON.stringify(deployData.details));
       }
 
-      setMessage("deployMessage", "Deploy sukses! Menyimpan worker ke dashboard...");
+      const envNote = Array.isArray(deployData.env) && deployData.env.length
+        ? ` · env terpasang: ${deployData.env.join(", ")}`
+        : "";
+      setMessage("deployMessage", "Deploy sukses! Menyimpan worker ke dashboard..." + envNote);
 
       // Pakai host dari API response (sudah include subdomain asli)
       const finalHost = deployData.host || `${name}.workers.dev`;
@@ -749,6 +770,20 @@ function renderDeploy() {
     }
   };
 }
+// Nilai relay UDP dari halaman Deploy. Hanya untuk worker VPN (Load Balancer tidak memakai
+// relay) dan hanya dikirim kalau host relay diisi — kosong berarti tidak ada binding env.
+function collectRelayVars(type) {
+  if (type === "load_balancer") return {};
+  const host = $("relayHost")?.value.trim() || "";
+  if (!host) return {};
+  return {
+    RELAY_SERVER_UDP: host,
+    RELAY_SERVER_PORT: $("relayPort")?.value.trim() || "7300",
+    RELAY_SERVER_TLS: $("relayTls")?.value || "",
+    RELAY_SECRET: $("relaySecret")?.value.trim() || "",
+  };
+}
+
 async function hashPassword(password) { 
   const bytes = new TextEncoder().encode(password); 
   const hash = await crypto.subtle.digest("SHA-256", bytes); 

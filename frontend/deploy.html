@@ -62,10 +62,45 @@
         <label class="field" id="tierField" style="margin-top: 15px;">
           <span>VERSI WORKER</span>
           <select id="deployTier">
-            <option value="free">Free (UDP Relay: hobihaus)</option>
-            <option value="prem">Premium (UDP Relay: Railway)</option>
+            <option value="free">Free</option>
+            <option value="prem">Premium</option>
           </select>
         </label>
+
+        <hr style="border: 0; border-top: 1px solid var(--line); margin: 25px 0;">
+
+        <div id="relayFields">
+          <p class="eyebrow" style="margin-bottom: 6px;">Relay UDP (opsional)</p>
+          <p class="page-intro" style="margin-top: 0;">
+            Worker Cloudflare tidak punya UDP keluar. Isi bagian ini kalau kamu punya relay UDP
+            sendiri (mis. <a href="https://github.com/jhopan/Pan-VlessRelay" target="_blank" rel="noopener">Pan-VlessRelay</a>)
+            supaya UDP non-DNS (QUIC, game, WireGuard) ikut jalan. Kosongkan = UDP non-DNS ditutup
+            cepat (DNS tetap jalan lewat DoH).
+          </p>
+          <div class="fields-row">
+            <label class="field">
+              <span>HOST RELAY</span>
+              <input id="relayHost" placeholder="relay.domainmu.com" autocomplete="off">
+            </label>
+            <label class="field">
+              <span>PORT RELAY</span>
+              <input id="relayPort" placeholder="7300" inputmode="numeric" autocomplete="off">
+            </label>
+          </div>
+          <div class="fields-row" style="margin-top: 15px;">
+            <label class="field">
+              <span>RELAY PAKAI TLS</span>
+              <select id="relayTls">
+                <option value="">tidak</option>
+                <option value="1">ya (port 443 + sertifikat)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>RAHASIA RELAY</span>
+              <input id="relaySecret" type="password" placeholder="harus sama dengan RELAY_SECRET di relay" autocomplete="new-password">
+            </label>
+          </div>
+        </div>
 
         <p class="form-message" id="deployMessage" aria-live="polite"></p>
 

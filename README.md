@@ -197,6 +197,33 @@ Set env vars di `cron-worker/wrangler.toml` atau Cloudflare dashboard.
 
 **Batas role:** user biasa hanya mendapat Worker Free. Field versi Worker disembunyikan dan backend frontend selalu memilih `vpn-worker-free.js`. Admin dapat memilih Free atau Premium.
 
+## Relay UDP di Halaman Deploy
+
+Worker Cloudflare tidak punya UDP keluar. Supaya UDP non-DNS (QUIC/HTTP3, game, WireGuard, NTP)
+tetap jalan, jalankan relay UDP sendiri (repo
+[`Pan-VlessRelay`](https://github.com/jhopan/Pan-VlessRelay), Docker siap pakai) lalu isi bagian
+**Relay UDP (opsional)** di halaman Deploy:
+
+| Isian panel | Menjadi binding Worker | Contoh |
+|---|---|---|
+| Host relay | `RELAY_SERVER_UDP` | `relay.domainmu.com` |
+| Port relay | `RELAY_SERVER_PORT` | `7300` |
+| Pakai TLS | `RELAY_SERVER_TLS` | `1` (relay di port 443 dengan sertifikat) |
+| Rahasia relay | `RELAY_SECRET` | harus sama dengan `RELAY_SECRET` di relay |
+
+Panel mengirim nilai itu ke `/api/cf` sebagai `vars`, divalidasi, lalu dipasang sebagai binding
+pada Worker saat upload; respons deploy menampilkan daftar env yang terpasang. Kosongkan host
+(kosong = tidak ada binding) untuk perilaku lama: DNS tetap dijawab lewat DoH dan UDP selain DNS
+ditutup cepat. Rahasia wajib diisi kalau host diisi — relay menolak sambungan tanpa rahasia yang
+benar.
+
+Deploy massal (`deploy-bulk.mjs`) memakai env shell dengan nama yang sama
+(`RELAY_SERVER_UDP`, `RELAY_SERVER_PORT`, `RELAY_SERVER_TLS`, `RELAY_SECRET`) dan memasangnya
+sebagai binding untuk setiap worker.
+
+Catatan: jalur UDP lewat relay menambah satu hop dan memakai TCP, jadi QUIC berat bisa lebih
+lambat — protokol UDP kecil (DNS/NTP/game ringan) paling cocok.
+
 ## Bulk Deploy Script (Lokal)
 
 `deploy-bulk.mjs` adalah script lokal, bukan fitur frontend dan tidak ter-deploy ke Cloudflare Pages. Script membaca kredensial dari `.env`; jangan taruh key pada source code atau commit ke GitHub.

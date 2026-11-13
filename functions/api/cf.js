@@ -21,6 +21,17 @@ export async function onRequest(context) {
       });
     }
 
+    // Binding env opsional dari panel (dipakai mis. untuk relay UDP: RELAY_SERVER_UDP,
+    // RELAY_SERVER_PORT, RELAY_SERVER_TLS, RELAY_SECRET). Divalidasi ketat karena nilainya
+    // dikirim ke API Cloudflare sebagai binding plain_text.
+    const vars = normalizeVars(data.vars);
+    if (vars.error) {
+      return new Response(JSON.stringify({ error: vars.error }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     // 1. Get workers.dev subdomain
     let subdomain = null;
     const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
@@ -45,7 +56,11 @@ export async function onRequest(context) {
       `--${boundary}\r\n`,
       `Content-Disposition: form-data; name="metadata"\r\n`,
       `Content-Type: application/json\r\n\r\n`,
-      JSON.stringify({ main_module: moduleName, compatibility_date: "2024-05-12" }) + "\r\n",
+      JSON.stringify({
+        main_module: moduleName,
+        compatibility_date: "2024-05-12",
+        ...(vars.bindings.length ? { bindings: vars.bindings } : {}),
+      }) + "\r\n",
       `--${boundary}\r\n`,
       `Content-Disposition: form-data; name="${moduleName}"; filename="${moduleName}"\r\n`,
       `Content-Type: application/javascript+module\r\n\r\n`,
@@ -96,6 +111,7 @@ export async function onRequest(context) {
       success: true,
       host: finalHost,
       subdomain: subdomain || null,
+      env: vars.bindings.map((binding) => binding.name),
     }), {
       headers: { "Content-Type": "application/json" },
     });
@@ -106,4 +122,28 @@ export async function onRequest(context) {
       headers: { "Content-Type": "application/json" },
     });
   }
+}
+
+// normalizeVars mengubah objek env dari panel menjadi binding plain_text Cloudflare.
+// Aturannya sengaja ketat: nama variabel huruf/angka/garis bawah (maks 64), nilai string
+// (maks 1024), maksimal 12 pasangan, dan nilai kosong dilewati (artinya "jangan pasang").
+const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+const MAX_VARS = 12;
+const MAX_VAR_VALUE = 1024;
+
+export function normalizeVars(input) {
+  if (input === undefined || input === null) return { bindings: [] };
+  if (typeof input !== "object" || Array.isArray(input)) return { error: "Format env tidak valid." };
+
+  const bindings = [];
+  for (const [rawName, rawValue] of Object.entries(input)) {
+    const name = String(rawName).trim();
+    const value = rawValue === undefined || rawValue === null ? "" : String(rawValue).trim();
+    if (!value) continue;
+    if (!VAR_NAME.test(name)) return { error: "Nama env tidak valid: " + name };
+    if (value.length > MAX_VAR_VALUE) return { error: "Nilai env terlalu panjang: " + name };
+    if (bindings.length >= MAX_VARS) return { error: "Terlalu banyak env (maks " + MAX_VARS + ")." };
+    bindings.push({ type: "plain_text", name: name, text: value });
+  }
+  return { bindings: bindings };
 }
