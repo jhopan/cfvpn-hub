@@ -29,6 +29,10 @@ const CORS = {
 };
 
 const PROXY_HANDSHAKE_TIMEOUT = 8000;
+const SOCKS5_PROBE_TIMEOUT = 2500; // deteksi awal SOCKS5; proxy yang diam saja tidak menahan 8 detik
+const PROXY_PROTOCOL_MAX_ENTRIES = 64;
+const proxyProtocols = new Map(); // per-isolate: "host:port" -> "socks5" | "http"
+const dnsInflight = new Map(); // per-isolate: kunci cache -> Promise DoH yang sedang jalan
 const MAX_HEADER_BYTES = 4096;
 
 // Cache jawaban DoH per-isolate: setiap query DNS normalnya satu subrequest fetch, dan
@@ -152,12 +156,7 @@ async function websocketHandler(request, prx, env) {
 
 async function handleClientChunk(chunk, state, webSocket, prx, env) {
   if (state.remote) {
-    const w = state.remote.writable.getWriter();
-    try {
-      await w.write(chunk);
-    } finally {
-      w.releaseLock();
-    }
+    await writeToRemote(state, chunk);
     return;
   }
 
@@ -190,7 +189,7 @@ async function handleClientChunk(chunk, state, webSocket, prx, env) {
 
   const header = parsed.header;
 
-  if (!isUuidAllowed(header.uuid, env)) {
+  if (!isUuidAllowed(header.uuidBytes, env)) {
     safeClose(webSocket);
     return;
   }
@@ -295,7 +294,7 @@ async function handleDnsQuery(message, state, webSocket, env) {
 
   let answer;
   try {
-    answer = await resolveDoh(message, env);
+    answer = await resolveDohCoalesced(key, message, env);
   } catch (err) {
     // Semua endpoint DoH gagal: balas SERVFAIL supaya klien tahu saat itu juga dan tidak
     // menunggu timeout-nya sendiri (sebelumnya balasan tidak dikirim sama sekali).
@@ -305,8 +304,21 @@ async function handleDnsQuery(message, state, webSocket, env) {
   }
 
   if (state.cancelled || webSocket.readyState !== WS_OPEN) return;
-  sendVlessPayload(state, webSocket, answer);
+  // Query identik yang datang bersamaan berbagi satu jawaban DoH, jadi txid disesuaikan
+  // dengan pertanyaan pemanggil sebelum dikirim.
+  sendVlessPayload(state, webSocket, withTxid(answer, message));
   if (key) storeDnsAnswer(key, answer);
+}
+
+// Query identik yang sedang jalan berbagi satu panggilan DoH — beberapa koneksi ke domain
+// yang sama sering dibuka bersamaan, dan tiap panggilan DoH adalah satu subrequest fetch.
+function resolveDohCoalesced(key, query, env) {
+  if (!key) return resolveDoh(query, env);
+  const pending = dnsInflight.get(key);
+  if (pending) return pending;
+  const promise = resolveDoh(query, env).finally(function () { dnsInflight.delete(key); });
+  dnsInflight.set(key, promise);
+  return promise;
 }
 
 function sendVlessPayload(state, webSocket, payload) {
@@ -446,8 +458,10 @@ function minAnswerTtl(answer) {
 }
 
 // Jawaban cache dibuat ulang dengan txid pertanyaan baru (klien mencocokkan lewat txid).
+// Kalau txid-nya sama, array yang ada dipakai apa adanya supaya tidak ada salinan.
 function withTxid(answer, query) {
   if (answer.length < 2 || query.length < 2) return answer;
+  if (answer[0] === query[0] && answer[1] === query[1]) return answer;
   const out = new Uint8Array(answer);
   out[0] = query[0];
   out[1] = query[1];
@@ -603,7 +617,7 @@ async function openRawTunnel(bytes, webSocket, state, prx) {
   await w.write(bytes);
   w.releaseLock();
   state.remote = { readable: sock.readable, writable: sock.writable, close: function () { sock.close(); } };
-  pipeRemoteToWs(state.remote, webSocket, null);
+  pipeRemoteToWs(state.remote, webSocket, state);
 }
 
 async function tryViaProxy(header, webSocket, state, prx) {
@@ -618,7 +632,7 @@ async function tryViaProxy(header, webSocket, state, prx) {
     // Header balasan VLESS (2 byte) dikirim begitu tunnel siap, bukan menunggu byte pertama
     // dari target: target yang lama diam tidak lagi membuat klien menunggu tanpa kabar.
     if (webSocket.readyState === WS_OPEN) webSocket.send(header.version);
-    pipeRemoteToWs(tunnel, webSocket, null);
+    pipeRemoteToWs(tunnel, webSocket, state);
   } catch (err) {
     console.log("proxy gagal: " + err.message);
     safeClose(webSocket);
@@ -627,17 +641,33 @@ async function tryViaProxy(header, webSocket, state, prx) {
 
 async function openProxyTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
   const errors = [];
-  try {
-    return await socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
-  } catch (e) {
-    errors.push("socks5: " + e.message);
-  }
-  try {
-    return await httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
-  } catch (e) {
-    errors.push("http: " + e.message);
+  for (const protocol of proxyProtocolOrder(proxyHost, proxyPort)) {
+    try {
+      const tunnel = protocol === "socks5"
+        ? await socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs)
+        : await httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
+      rememberProxyProtocol(proxyHost, proxyPort, protocol);
+      return tunnel;
+    } catch (e) {
+      errors.push(protocol + ": " + e.message);
+    }
   }
   throw new Error(errors.join(" | "));
+}
+
+// Protokol yang terakhir berhasil di proxy ini dicoba lebih dulu: proxy HTTP-only tidak lagi
+// membayar satu koneksi + satu round trip SOCKS5 di setiap koneksi baru.
+function proxyProtocolOrder(host, port) {
+  return proxyProtocols.get(host + ":" + port) === "http" ? ["http", "socks5"] : ["socks5", "http"];
+}
+
+function rememberProxyProtocol(host, port, protocol) {
+  const key = host + ":" + port;
+  if (proxyProtocols.size >= PROXY_PROTOCOL_MAX_ENTRIES) {
+    const oldest = proxyProtocols.keys().next();
+    if (!oldest.done) proxyProtocols.delete(oldest.value);
+  }
+  proxyProtocols.set(key, protocol);
 }
 
 async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
@@ -647,7 +677,7 @@ async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeou
 
   try {
     await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
-    const g = await readBytes(reader, 2, timeoutMs, "socks5-greeting");
+    const g = await readBytes(reader, 2, SOCKS5_PROBE_TIMEOUT, "socks5-greeting");
     if (g.bytes[0] !== 0x05) throw new Error("bukan SOCKS5");
     if (g.bytes[1] !== 0x00) throw new Error("butuh auth");
 
@@ -900,11 +930,10 @@ function parseVlessHeader(view) {
   const total = atypIndex + 1 + addressLength;
   if (view.length < total) return { need: total };
 
-  const uuid = Array.from(view.slice(1, 17)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
-
   return {
     header: {
-      uuid: uuid,
+      // UUID dibiarkan sebagai byte: stringnya hanya dibangun kalau ada allowlist.
+      uuidBytes: view.subarray(1, 17),
       addressRemote: addressRemote,
       portRemote: portRemote,
       rawClientData: view.slice(total),
@@ -927,35 +956,27 @@ function concatBytes(first, second) {
   return out;
 }
 
-function isUuidAllowed(uuid, env) {
+function isUuidAllowed(uuidBytes, env) {
   if (!env) return true;
   const allowlist = env.UUID_ALLOWLIST;
   if (!allowlist) return true;
   const list = allowlist.split(",").map(function (u) { return u.trim().toLowerCase(); }).filter(Boolean);
   if (!list.length) return true;
-  const hex = String(uuid || "").toLowerCase();
-  const dashed = hex.length === 32
-    ? hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20)
-    : hex;
+
+  // Bangun hex hanya saat allowlist dipakai (tanpa allowlist, koneksi tidak membayar
+  // konversi + alokasi apa pun).
+  let hex = "";
+  for (let i = 0; i < uuidBytes.length; i++) hex += uuidBytes[i].toString(16).padStart(2, "0");
+  const dashed = hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
   return list.indexOf(hex) !== -1 || list.indexOf(dashed) !== -1;
 }
 
-async function pipeRemoteToWs(remote, webSocket, responseHeader) {
-  let header = responseHeader;
-
+async function pipeRemoteToWs(remote, webSocket, state) {
   try {
     await remote.readable.pipeTo(new WritableStream({
       async write(chunk) {
         if (webSocket.readyState !== WS_OPEN) return;
-        if (header) {
-          const merged = new Uint8Array(header.length + chunk.length);
-          merged.set(header, 0);
-          merged.set(chunk, header.length);
-          webSocket.send(merged);
-          header = null;
-        } else {
-          webSocket.send(chunk);
-        }
+        webSocket.send(chunk);
       },
       close() {},
       abort(reason) {
@@ -964,25 +985,39 @@ async function pipeRemoteToWs(remote, webSocket, responseHeader) {
     }));
   } catch (err) {
     console.log("pipe error: " + (err && err.message));
+    shutdownRemote(state, false);
     safeClose(webSocket);
     return;
   }
 
-  // Target sudah menutup koneksi: jangan biarkan WebSocket menggantung.
+  // Target sudah menutup koneksi: lepaskan state supaya potongan berikutnya dari klien tidak
+  // menulis ke soket mati, lalu tutup WebSocket agar klien tidak menggantung.
+  state.remote = null;
+  state.remoteWriter = null;
   safeClose(webSocket);
+}
+
+// Writer ditahan selama tunnel hidup: menghindari getWriter()/releaseLock() pada setiap
+// potongan data dari klien (ongkos CPU yang terasa pada transfer panjang).
+async function writeToRemote(state, chunk) {
+  if (!state.remoteWriter) state.remoteWriter = state.remote.writable.getWriter();
+  await state.remoteWriter.write(chunk);
 }
 
 function shutdownRemote(state, graceful) {
   const remote = state.remote;
+  const writer = state.remoteWriter;
   state.remote = null;
+  state.remoteWriter = null;
   if (!remote) return;
-  if (graceful) {
-    try {
-      remote.writable.getWriter().close().catch(function () {
-        try { remote.close(); } catch (e) {}
-      });
-      return;
-    } catch (e) {}
+  if (graceful && writer) {
+    writer.close().catch(function () {
+      try { remote.close(); } catch (e) {}
+    });
+    return;
+  }
+  if (writer) {
+    try { writer.releaseLock(); } catch (e) {}
   }
   try { remote.close(); } catch (e) {}
 }

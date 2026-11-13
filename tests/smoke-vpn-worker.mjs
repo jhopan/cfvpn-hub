@@ -10,6 +10,7 @@
 //   7302 proxy palsu: menolak SOCKS5 no-auth lalu melayani HTTP CONNECT + echo
 //   7303 DoH: POST /dns-query -> jawaban A 93.184.216.34
 //   7304 proxy SOCKS5 yang menerima no-auth: mencatat ATYP + alamat tujuan
+//   7306 proxy HTTP-only kedua: menguji protokol proxy diingat antar koneksi
 //
 // Skenario:
 //   1. DNS (cmd=2 port 53) framing Xray `[2B panjang][query]` -> balasan `00 00` + `[2B][jawaban]`
@@ -23,8 +24,11 @@
 //   9. SOCKS5: tujuan IP numerik dikirim ATYP 1/4, bukan domain
 //  10. HTTP CONNECT: target IPv6 dikurung siku
 //  11. Cache DoH: query sama diulang tidak memanggil DoH lagi (txid tetap diperbarui)
-//  12. DoH endpoint utama mati -> fallback dipakai (worker kedua)
-//  13. Semua endpoint DoH mati -> balasan SERVFAIL, bukan diam (worker kedua)
+//  12. Proxy HTTP-only: protokol diingat, koneksi kedua tidak mencoba SOCKS5
+//  13. Query DNS identik bersamaan: satu panggilan DoH, dua balasan ber-txid sendiri
+//  14. UUID di luar UUID_ALLOWLIST ditolak
+//  15. DoH endpoint utama mati -> fallback dipakai (worker kedua)
+//  16. Semua endpoint DoH mati -> balasan SERVFAIL, bukan diam (worker kedua)
 //
 // Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker uji DoH memakai port+1).
 import net from "node:net";
@@ -88,8 +92,8 @@ const startRaw = () =>
     sock.on("data", (d) => { S.raw.all = Buffer.concat([S.raw.all, d]); });
   });
 
-const startProxy = () =>
-  listen(7302, (sock) => {
+const startProxy = (port = 7302) =>
+  listen(port, (sock) => {
     let phase = "greeting";
     sock.on("error", () => {});
     sock.on("close", () => S.proxy.closes++);
@@ -255,7 +259,7 @@ async function until(fn, timeoutMs = 3000, pollMs = 50) {
 }
 
 // atyp: 1 = IPv4, 2 = domain (bawaan), 3 = IPv6 — sama seperti VLESS.
-function frame({ cmd, host = "dns.local", port, payload, atyp = 2 }) {
+function frame({ cmd, host = "dns.local", port, payload, atyp = 2, uuid = UUID_HEX }) {
   let address;
   if (atyp === 1) {
     address = Buffer.from([0x01, ...host.split(".").map(Number)]);
@@ -267,7 +271,7 @@ function frame({ cmd, host = "dns.local", port, payload, atyp = 2 }) {
   }
   return Buffer.concat([
     Buffer.from([0x00]),
-    Buffer.from(UUID_HEX, "hex"),
+    Buffer.from(uuid, "hex"),
     Buffer.from([0x00]),
     Buffer.from([cmd]),
     Buffer.from([(port >> 8) & 0xff, port & 0xff]),
@@ -513,6 +517,72 @@ async function scenarioDnsCache() {
   return { name: "DNS cache: query sama diulang tidak memanggil DoH lagi", pass: pass, detail: `dohSetelahPertama=${dohAfterFirst} dohTotal=${S.doh.requests.length} len1=${len1} len2=${len2} txid2=${txid2}` };
 }
 
+// Satu koneksi TCP uji lewat proxy: kirim frame cmd=1, tunggu echo, ukur waktu dan hitung
+// percobaan SOCKS5 yang terjadi selama koneksi itu.
+async function connectTcpViaProxy(proxyPath, port) {
+  const payload = Buffer.from("PING");
+  const socksBefore = S.proxy.socks5;
+  S.proxy.echoed = false;
+  const started = Date.now();
+  const { ws, received } = await openWs(proxyPath, PORT);
+  ws.send(frame({ cmd: 1, host: "example.com", port: port, payload }));
+  const ok = await until(() => received().length >= 8, 10000);
+  const ms = Date.now() - started;
+  try { ws.close(); } catch {}
+  return { ok: ok, ms: ms, socks5: S.proxy.socks5 - socksBefore };
+}
+
+// Proxy yang cuma bisa HTTP CONNECT: setelah protokolnya diketahui, koneksi berikutnya tidak
+// lagi membayar satu koneksi + satu round trip SOCKS5.
+async function scenarioProxyProtocolMemo() {
+  const first = await connectTcpViaProxy("/127.0.0.1:7306", 80);
+  const second = await connectTcpViaProxy("/127.0.0.1:7306", 80);
+  const pass = first.ok && second.ok && first.socks5 === 1 && second.socks5 === 0;
+  return {
+    name: "Proxy HTTP-only: protokol diingat, koneksi kedua tak coba SOCKS5",
+    pass: pass,
+    detail: `pertama: socks5=${first.socks5} echo=${first.ok} ${first.ms}ms · kedua: socks5=${second.socks5} echo=${second.ok} ${second.ms}ms`,
+  };
+}
+
+// Dua query identik yang dikirim bersamaan (satu frame) harus berbagi satu panggilan DoH,
+// tapi masing-masing tetap menerima balasan dengan txid-nya sendiri.
+async function scenarioDnsCoalesce() {
+  S.doh.requests = [];
+  S.doh.answers = 0;
+  const name = "coalesce-uji.local";
+  const { ws, received } = await openWs("/1.2.3.4:5678", PORT);
+  ws.send(frame({ cmd: 2, port: 53, payload: Buffer.concat([prefixed(dnsQuery(0x7777, name)), prefixed(dnsQuery(0x8888, name))]) }));
+  await until(() => S.doh.answers >= 1, 8000);
+  await until(() => false, 400);
+  const got = received();
+  ws.close();
+
+  const len1 = got.length >= 4 ? (got[2] << 8) | got[3] : 0;
+  const txid1 = got.subarray(4, 6).toString("hex");
+  const off = 4 + len1;
+  const len2 = got.length >= off + 4 ? (got[off] << 8) | got[off + 1] : 0;
+  const txid2 = got.length >= off + 4 ? got.subarray(off + 2, off + 4).toString("hex") : "";
+  const pass = S.doh.requests.length === 1 && [txid1, txid2].sort().join(",") === "7777,8888" && len1 > 0 && len2 > 0;
+  return {
+    name: "Query DNS identik bersamaan: satu panggilan DoH, dua balasan",
+    pass: pass,
+    detail: `doh=${S.doh.requests.length} txid=${txid1},${txid2} len=${len1},${len2}`,
+  };
+}
+
+// UUID_ALLOWLIST diisi di fixture: UUID yang diizinkan harus jalan (semua skenario lain),
+// yang di luar daftar harus diputus.
+async function scenarioUuidBlocked() {
+  const { ws, received, isClosed } = await openWs("/127.0.0.1:7302", PORT);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload: Buffer.from("PING"), uuid: "ff".repeat(16) }));
+  const closed = await until(() => isClosed(), 4000);
+  await until(() => false, 200);
+  const silent = received().length === 0;
+  try { ws.close(); } catch {}
+  return { name: "UUID di luar UUID_ALLOWLIST ditolak", pass: closed && silent, detail: `wsTertutup=${closed} tanpaData=${silent}` };
+}
+
 // Endpoint DoH utama sengaja mati: worker harus memakai env.DOH_FALLBACK.
 async function scenarioDohFallback(port) {
   S.doh.requests = [];
@@ -568,10 +638,13 @@ const workers = [];
 try {
   if (!fs.existsSync(WRANGLER)) throw new Error(`wrangler tidak ada di ${WRANGLER} — jalankan npm install dulu`);
   const dohStub = await startDoh();
-  stubs.push(await startRaw(), await startProxy(), await startSocks(), dohStub);
+  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startSocks(), dohStub);
 
   workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-")));
-  makeFixture(workdirs[0], { DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query" });
+  makeFixture(workdirs[0], {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    UUID_ALLOWLIST: UUID_HEX, // semua frame uji memakai UUID ini; skenario negatif pakai UUID lain
+  });
   reset();
   workers.push(startWorker(workdirs[0], PORT));
 
@@ -589,6 +662,9 @@ try {
   results.push(await scenarioSocks5Numeric());
   results.push(await scenarioHttpConnectIpv6());
   results.push(await scenarioDnsCache());
+  results.push(await scenarioProxyProtocolMemo());
+  results.push(await scenarioDnsCoalesce());
+  results.push(await scenarioUuidBlocked());
 
   // Worker kedua: endpoint DoH utama sengaja mati supaya jalur fallback dan SERVFAIL teruji.
   workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-doh-")));
