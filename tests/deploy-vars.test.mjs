@@ -49,3 +49,15 @@ test("format env bukan objek ditolak", () => {
   assert.match(normalizeVars(["RELAY_SECRET=1"]).error, /Format env tidak valid/);
   assert.match(normalizeVars("RELAY_SECRET=1").error, /Format env tidak valid/);
 });
+
+test("UUID_ALLOWLIST divalidasi formatnya (hex/dashed, boleh banyak)", () => {
+  const ok = normalizeVars({ UUID_ALLOWLIST: "14df7aee-0416-45a8-a651-e69de188deca" });
+  assert.equal(ok.error, undefined);
+  assert.equal(ok.bindings[0].name, "UUID_ALLOWLIST");
+
+  const many = normalizeVars({ UUID_ALLOWLIST: "14df7aee041645a8a651e69de188deca, 8c6976e5-b541-0415-bde9-08bd4dee15df" });
+  assert.equal(many.error, undefined);
+
+  assert.match(normalizeVars({ UUID_ALLOWLIST: "bukan-uuid" }).error, /UUID pada UUID_ALLOWLIST tidak valid/);
+  assert.match(normalizeVars({ UUID_ALLOWLIST: "14df7aee-0416-45a8-a651" }).error, /tidak valid/);
+});

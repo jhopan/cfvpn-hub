@@ -142,6 +142,12 @@ export function normalizeVars(input) {
     if (!value) continue;
     if (!VAR_NAME.test(name)) return { error: "Nama env tidak valid: " + name };
     if (value.length > MAX_VAR_VALUE) return { error: "Nilai env terlalu panjang: " + name };
+    if (name === "UUID_ALLOWLIST") {
+      const entries = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+      if (!entries.length) continue;
+      const bad = entries.find((entry) => !/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(entry));
+      if (bad) return { error: "UUID pada UUID_ALLOWLIST tidak valid: " + bad };
+    }
     if (bindings.length >= MAX_VARS) return { error: "Terlalu banyak env (maks " + MAX_VARS + ")." };
     bindings.push({ type: "plain_text", name: name, text: value });
   }

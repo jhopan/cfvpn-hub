@@ -67,6 +67,19 @@
           </select>
         </label>
 
+        <label class="field" style="margin-top: 15px;">
+          <span>UUID WORKER (kunci akses)</span>
+          <input id="deployUuid" placeholder="kosong = terima UUID apa pun (tidak disarankan)" autocomplete="off" spellcheck="false">
+          <small style="margin-top: 4px;">
+            Kalau diisi, worker hanya menerima UUID ini (binding <code>UUID_ALLOWLIST</code>) dan
+            generator memakai UUID yang sama. Kosongkan hanya kalau kamu memang ingin worker
+            terbuka untuk UUID apa pun.
+          </small>
+        </label>
+        <div class="form-actions" style="margin-top: 10px;">
+          <button class="button secondary" id="genUuidBtn" type="button">Buat UUID</button>
+        </div>
+
         <hr style="border: 0; border-top: 1px solid var(--line); margin: 25px 0;">
 
         <div id="relayFields">

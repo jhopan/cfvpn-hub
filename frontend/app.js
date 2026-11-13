@@ -113,7 +113,10 @@ async function generateLocalConfigs(params) {
   
   shuffleArray(proxies);
 
-  const uuid = crypto.randomUUID();
+  // Kalau worker ini dikunci dengan UUID saat deploy (binding UUID_ALLOWLIST), pakai UUID itu —
+  // kalau tidak, worker akan menolak koneksi.
+  const boundWorker = (state.workers || []).find((w) => w.host === params.host && w.uuid);
+  const uuid = boundWorker ? boundWorker.uuid : crypto.randomUUID();
   const configs = [];
   outer: for (const proxy of proxies) {
     for (const port of params.portList) {
@@ -309,6 +312,35 @@ function renderDashboard() {
     } catch { el.textContent = 0; }
   })();
 }
+// Versi template worker yang terpasang di frontend ini. Harus sama dengan WORKER_VERSION di
+// frontend/source/vpn-worker-*.js: /health mengembalikannya, jadi panel bisa menandai worker
+// yang masih versi lama dan menawarkan deploy ulang.
+const WORKER_TEMPLATE_VERSION = "2026-11-13b";
+
+// Cek versi tiap worker aktif lewat /health (CORS terbuka) dan tampilkan badge.
+async function checkWorkerVersions(workers) {
+  await Promise.all(
+    workers.filter((w) => w.active).map(async (worker) => {
+      const el = document.querySelector(`[data-version="${worker.id}"]`);
+      if (!el) return;
+      try {
+        const res = await fetch(`https://${worker.host}/health`, { signal: AbortSignal.timeout(6000) });
+        if (!res.ok) throw new Error(`http ${res.status}`);
+        const data = await res.json();
+        if (data.version === WORKER_TEMPLATE_VERSION) {
+          el.innerHTML = "<b>terbaru</b>";
+          return;
+        }
+        const link = `deploy.html?name=${encodeURIComponent(worker.name)}&type=${encodeURIComponent(worker.type)}&uuid=${encodeURIComponent(worker.uuid || "")}`;
+        el.innerHTML = `versi lama (${escapeHtml(String(data.version || "?"))}) · <a href="${link}">deploy ulang</a>`;
+        el.style.borderColor = "var(--warn)";
+      } catch (err) {
+        el.textContent = "versi tidak diketahui";
+      }
+    })
+  );
+}
+
 function renderWorkers() {
   if (!$("workerList")) return;
   $("emptyWorkers").hidden = state.workers.length > 0;
@@ -323,7 +355,7 @@ function renderWorkers() {
       const subUrl = `${worker.host}/api/v1/sub?format=raw&limit=20${domains.length ? "&domains=" + domains.join(",") : ""}`;
       extra = `<div class="lb-details"><div class="lb-domains"><span class="eyebrow">VPN Worker terhubung</span><code>${domains.length ? escapeHtml(domains.join(", ")) : "<i>Belum ada</i>"}</code></div><div class="lb-sub"><span class="eyebrow">URL Subscription</span><div class="sub-row"><code class="sub-url">${escapeHtml(subUrl)}</code><button class="icon-button" data-copy-sub="${escapeHtml(subUrl)}" type="button">Copy</button></div></div><button class="icon-button" data-edit-lb="${worker.id}" type="button" style="margin-top:8px">Edit VPN Domains</button></div>`;
     }
-    return `<article class="worker-card worker-card-lb"><div class="worker-card-head"><div><p class="worker-title">${escapeHtml(worker.name)}</p><code>${escapeHtml(worker.host)}</code></div><div class="worker-meta"><span class="type">${typeLabel(worker.type)}</span><label class="switch"><input data-toggle="${worker.id}" type="checkbox" ${worker.active ? "checked" : ""}><span></span><b>${worker.active ? "Aktif" : "Nonaktif"}</b></label>${worker.type === "vpn" ? `<a class="icon-button" href="generator.html?worker=${worker.id}">Pakai</a>` : ""}<button class="icon-button danger" data-delete="${worker.id}" type="button">Hapus</button></div></div>${extra}</article>`;
+    return `<article class="worker-card worker-card-lb"><div class="worker-card-head"><div><p class="worker-title">${escapeHtml(worker.name)}</p><code>${escapeHtml(worker.host)}</code></div><div class="worker-meta"><span class="type">${typeLabel(worker.type)}</span><label class="switch"><input data-toggle="${worker.id}" type="checkbox" ${worker.active ? "checked" : ""}><span></span><b>${worker.active ? "Aktif" : "Nonaktif"}</b></label>${worker.type === "vpn" ? `<a class="icon-button" href="generator.html?worker=${worker.id}">Pakai</a><span class="badge" data-version="${worker.id}" style="margin-left:6px">cek versi…</span>` : ""}<button class="icon-button danger" data-delete="${worker.id}" type="button">Hapus</button></div></div>${extra}</article>`;
   };
 
   const sectionHtml = (title, count, workers) => {
@@ -334,6 +366,8 @@ function renderWorkers() {
   $("workerList").innerHTML =
     sectionHtml("VPN Worker", vpnWorkers.filter(w => w.active).length, vpnWorkers) +
     sectionHtml("Load Balancer", lbWorkers.filter(w => w.active).length, lbWorkers);
+
+  checkWorkerVersions(vpnWorkers);
 
   $("showAddWorker").onclick = () => {
     const form = $("addWorkerForm");
@@ -679,6 +713,27 @@ function renderDeploy() {
     syncRelayFields();
   }
 
+  // UUID worker: tombol pembuat + prefill dari query (dipakai tautan "deploy ulang" dari
+  // halaman Workers) supaya redeploy memakai UUID yang sama dengan konfigurasi klien lama.
+  const uuidInput = $("deployUuid");
+  if (uuidInput) {
+    const query = new URLSearchParams(location.search);
+    if (!uuidInput.value) uuidInput.value = query.get("uuid") || "";
+    const genBtn = $("genUuidBtn");
+    if (genBtn) genBtn.onclick = () => { uuidInput.value = crypto.randomUUID(); };
+  }
+  const nameInput = $("deployName");
+  if (nameInput) {
+    const query = new URLSearchParams(location.search);
+    const nameParam = query.get("name");
+    if (nameParam) nameInput.value = nameParam.toLowerCase();
+    const typeParam = query.get("type");
+    if (typeParam && typeSelect) {
+      typeSelect.value = typeParam;
+      typeSelect.dispatchEvent(new Event("change"));
+    }
+  }
+
   $("deployForm").onsubmit = async (event) => { 
     event.preventDefault(); 
     const type = $("deployType").value; 
@@ -691,6 +746,13 @@ function renderDeploy() {
     // Relay tanpa rahasia akan ditolak relay-nya sendiri, jadi cegah di sini.
     if (($("relayHost")?.value.trim() || "") && !($("relaySecret")?.value.trim() || "")) {
       setMessage("deployMessage", "Rahasia relay wajib diisi kalau host relay diisi.", true);
+      return;
+    }
+
+    // UUID opsional: kalau diisi, worker dikunci ke UUID ini (binding UUID_ALLOWLIST).
+    const uuidValue = ($("deployUuid")?.value || "").trim();
+    if (uuidValue && !/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(uuidValue)) {
+      setMessage("deployMessage", "UUID tidak valid (format 8-4-4-4-12 heksadesimal).", true);
       return;
     }
 
@@ -737,7 +799,10 @@ function renderDeploy() {
           scriptName: name,
           code,
           type,
-          vars: collectRelayVars(type),
+          vars: {
+            ...(uuidValue ? { UUID_ALLOWLIST: uuidValue } : {}),
+            ...collectRelayVars(type),
+          },
         })
       });
 
@@ -761,7 +826,8 @@ function renderDeploy() {
         host: finalHost,
         type,
         active: true,
-        source: "cloudflare-auto"
+        source: "cloudflare-auto",
+        uuid: uuidValue || undefined,
       });
 
       await saveState();
