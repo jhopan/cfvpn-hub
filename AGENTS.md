@@ -204,7 +204,7 @@ Project lama `cgflrpjavyotvolnvcnl` (anon-key-only, bukan milik akun ini) tidak 
 
 ```bash
 nrun node --check frontend/app.js
-curl -sL -o /dev/null -w "%{http_code}" https://cfvpn-hub-dcx.pages.dev/<page>
+curl -sL -o /dev/null -w "%{http_code}" https://cfvpn-hub-9xy.pages.dev/<page>
 ```
 
 After a deploy, confirm https://cfvpn-hub-9xy.pages.dev actually reflects the change (hard refresh; service-worker cache).

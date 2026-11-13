@@ -2,7 +2,7 @@
 
 Panel manajemen VPN Worker untuk Cloudflare. Kelola Worker, generate config VLESS/Trojan/Shadowsocks, dan kelola proxy pool dari satu tempat.
 
-**Live:** [https://cfvpn-hub-dcx.pages.dev](https://cfvpn-hub-dcx.pages.dev)
+**Live:** [https://cfvpn-hub-9xy.pages.dev](https://cfvpn-hub-9xy.pages.dev)
 
 ## Fitur
 
