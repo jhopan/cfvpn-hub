@@ -13,6 +13,8 @@
 //   7306 proxy HTTP-only kedua: menguji protokol proxy diingat antar koneksi
 //   7308 proxy "setengah mati": handshake sukses lalu tidak pernah mengirim data
 //   7309 REST proxy_pool palsu: mengembalikan satu baris {ip,port} untuk uji failover pool
+//   7311 proxy HTTP-only yang diam terhadap SOCKS5: uji race protokol
+//   7312 proxy yang mengirim 20 potongan 256 B berjarak ~1 ms: uji batching socket->WS
 //
 // Skenario:
 //   1. DNS (cmd=2 port 53) framing Xray `[2B panjang][query]` -> balasan `00 00` + `[2B][jawaban]`
@@ -38,6 +40,11 @@
 //  21. Semua endpoint DoH mati -> balasan SERVFAIL, bukan diam (worker kedua)
 //  22. Watchdog: target diam -> koneksi ditutup, tidak menggantung (worker IDLE_CLOSE_SECONDS=1)
 //  23. Failover pool: daftar dari proxy_pool ditunggu lalu dipakai (worker FALLBACK_POOL=on)
+//  24. Early data lewat query ?ed= tanpa mengirim pesan WS
+//  25. Protokol belum diketahui: SOCKS5 & HTTP CONNECT dicoba paralel (bukan berurutan)
+//  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
+//  27. Batching dimatikan (WS_BATCH_MS=0): satu pesan per potongan (pembanding)
+//  28. Log dibatasi: 3 kegagalan proxy -> 1 baris log, counter /health tetap naik
 //
 // Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+3).
 import net from "node:net";
@@ -70,6 +77,8 @@ const S = {
   socks: { greeting: 0, requests: [], closes: 0, echoed: false },
   silent: { handshakes: 0 },
   pool: { requests: [] },
+  race: { socksSilent: 0, http: 0, closes: 0, echoed: false },
+  stream: { chunks: 0, }, 
   doh: { requests: [], answers: 0, answerLength: 0 },
 };
 
@@ -88,6 +97,11 @@ function reset() {
   S.socks.echoed = false;
   S.silent.handshakes = 0;
   S.pool.requests = [];
+  S.race.socksSilent = 0;
+  S.race.http = 0;
+  S.race.closes = 0;
+  S.race.echoed = false;
+  S.stream.chunks = 0;
   S.doh.requests = [];
   S.doh.answers = 0;
 }
@@ -256,6 +270,55 @@ const startSilentProxy = () =>
     });
   });
 
+// --- stub proxy HTTP CONNECT yang DIAM kalau dikirimi SOCKS5 (port 7311) ---------------
+// Dipakai menguji race protokol: kalau worker mencoba SOCKS5 lebih dulu (berurutan), ia harus
+// menunggu timeout; dengan race, jalur HTTP CONNECT langsung jalan.
+const startRaceProxy = () =>
+  listen(7311, (sock) => {
+    let phase = "first";
+    sock.on("error", () => {});
+    sock.on("close", () => S.race.closes++);
+    sock.on("data", (d) => {
+      if (phase === "first") {
+        if (d[0] === 0x05) {
+          S.race.socksSilent++; // sengaja tidak dibalas
+          return;
+        }
+        phase = "tunnel";
+        S.race.http++;
+        sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        return;
+      }
+      if (!S.race.echoed) {
+        S.race.echoed = true;
+        sock.write(Buffer.concat([Buffer.from([0x55, 0x66]), d]));
+      }
+    });
+  });
+
+// --- stub proxy yang mengirim banyak potongan kecil (port 7312) ------------------------
+// Dipakai mengukur batching socket->WS: 20 tulisan berjarak ~1 ms.
+const startStreamProxy = () =>
+  listen(7312, (sock) => {
+    let phase = "first";
+    sock.on("error", () => {});
+    sock.on("data", (d) => {
+      if (phase !== "first") return;
+      if (d[0] === 0x05) return;
+      phase = "stream";
+      sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      let sent = 0;
+      const timer = setInterval(() => {
+        sent++;
+        S.stream.chunks++;
+        try {
+          sock.write(Buffer.alloc(256, 0x41));
+        } catch (err) {}
+        if (sent >= 20) clearInterval(timer);
+      }, 1);
+    });
+  });
+
 const startDoh = () =>
   new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
@@ -388,7 +451,7 @@ function openWs(wsPath, port = PORT) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ ws, received: () => Buffer.concat(chunks), isClosed: () => closed });
+      resolve({ ws, received: () => Buffer.concat(chunks), messages: () => chunks.length, isClosed: () => closed });
     });
     ws.addEventListener("error", () => {
       if (settled) return;
@@ -846,9 +909,201 @@ async function scenarioHealth(port) {
   const res = await fetch("http://127.0.0.1:" + port + "/health");
   const body = await res.json();
   const ok = res.status === 200 && body.ok === true && typeof body.fallback_uses === "number" &&
-    typeof body.dns_mode === "string" && body.dns_hits && typeof body.dns_hits.memory === "number" &&
-    typeof body.proxy_memo === "number";
-  return { name: "/health melaporkan kondisi isolate", pass: ok, detail: JSON.stringify(body).slice(0, 220) };
+    body.fallback_uses >= 1 && typeof body.dns_mode === "string" && body.dns_hits &&
+    typeof body.dns_hits.memory === "number" && typeof body.proxy_memo === "number" &&
+    typeof body.version === "string" && body.counters && typeof body.counters.proxyFail === "number" &&
+    body.log_emitted && typeof body.log_emitted === "object";
+  return { name: "/health melaporkan kondisi isolate", pass: ok, detail: JSON.stringify(body).slice(0, 240) };
+}
+
+// Early data lewat query `?ed=` (bukan header): klien tidak mengirim pesan WS apa pun,
+// seluruh frame pertama ada di URL.
+async function scenarioEarlyDataQuery() {
+  S.doh.requests = [];
+  S.doh.answers = 0;
+  const payload = frame({ cmd: 2, port: 53, payload: prefixed(dnsQuery(0xeded, "ed-uji.local")) });
+  const encoded = Buffer.from(payload).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  const { ws, received } = await openWs("/1.2.3.4:5678?ed=" + encoded, PORT);
+
+  const answered = await until(() => received().length > 2, 8000);
+  await until(() => false, 300);
+  const got = received();
+  try { ws.close(); } catch {}
+  const txid = got.length >= 6 ? got.subarray(4, 6).toString("hex") : "";
+  return {
+    name: "Early data lewat query ?ed= (tanpa pesan WS)",
+    pass: answered && txid === "eded" && S.doh.requests.length === 1,
+    detail: `jawaban=${answered} txid=${txid} doh=${S.doh.requests.length}`,
+  };
+}
+
+// Protokol proxy belum diketahui: SOCKS5 dan HTTP CONNECT jalan bersamaan, jadi proxy
+// HTTP-only yang diam terhadap SOCKS5 tidak lagi memakan waktu probe 2,5 detik.
+async function scenarioProxyRace() {
+  S.race.socksSilent = 0;
+  S.race.http = 0;
+  S.race.closes = 0;
+  S.race.echoed = false;
+  const started = Date.now();
+  const { ws, received } = await openWs("/127.0.0.1:7311", PORT);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload: Buffer.from("PING") }));
+  const echoed = await until(() => received().length >= 8, 8000);
+  const ms = Date.now() - started;
+  try { ws.close(); } catch {}
+  await until(() => false, 300);
+
+  const fast = ms < 2200; // berurutan: minimal 2,5 s (probe SOCKS5) sebelum fallback
+  return {
+    name: "Protokol belum diketahui: SOCKS5 & HTTP dicoba paralel",
+    pass: echoed && S.race.socksSilent >= 1 && S.race.http >= 1 && fast,
+    detail: `echo=${echoed} ${ms}ms socks5Diam=${S.race.socksSilent} httpConnect=${S.race.http} soketKalahDitutup=${S.race.closes}`,
+  };
+}
+
+// Batching socket->WS: 20 potongan 256 B dari target dikirim sebagai berapa pesan WS?
+async function scenarioBatching(port, expectBatched) {
+  S.stream.chunks = 0;
+  S.race.echoed = false;
+  const { ws, received, messages } = await openWs("/127.0.0.1:7312", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload: Buffer.from("PING") }));
+  const total = 2 + 20 * 256; // header VLESS 2 B + 20 potongan
+  await until(() => received().length >= total, 8000);
+  await until(() => false, 400);
+  const bytes = received().length;
+  const count = messages();
+  try { ws.close(); } catch {}
+
+  const pass = bytes === total && (expectBatched ? count <= 14 : count >= 15);
+  return {
+    name: expectBatched ? "Batching WS aktif: potongan digabung" : "Batching dimatikan (WS_BATCH_MS=0): satu pesan per potongan",
+    pass: pass,
+    detail: `pesan=${count} byte=${bytes} (harap ${total})`,
+  };
+}
+
+// Log dibatasi: tiga kejadian berturut-turut harus menghasilkan SATU baris log; hitungannya
+// bisa dilihat di /health (counters vs log_emitted), jadi tidak perlu membaca stdout worker.
+async function scenarioLogGate(port) {
+  for (let i = 0; i < 3; i++) {
+    const { ws, isClosed } = await openWs("/127.0.0.1:7302", port);
+    ws.send(frame({ cmd: 2, port: 4444, payload: Buffer.from([1, 2, 3, 4]) }));
+    await until(() => isClosed(), 3000);
+    try { ws.close(); } catch {}
+  }
+  await sleep(300);
+
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json();
+  const seen = health.counters ? health.counters.udpUnsupported : -1;
+  const emitted = health.log_emitted ? health.log_emitted.udpUnsupported : -1;
+  return {
+    name: "Log dibatasi: 3 kejadian -> 1 baris log (counter tetap 3)",
+    pass: seen >= 3 && emitted === 1,
+    detail: `kejadian=${seen} barisLog=${emitted} versi=${health.version}`,
+  };
+}
+
+// Mux (cmd=3): header VLESS tanpa alamat, lalu frame New/Keep/End; tiap sub-koneksi punya
+// tunnel sendiri ke proxy.
+async function scenarioMux(port) {
+  const payload = Buffer.from("PING");
+  S.proxy.echoed = false;
+  const closesBefore = S.proxy.closes;
+  const { ws, received } = await openWs("/127.0.0.1:7302", port);
+  ws.send(Buffer.concat([muxVlessHeader(), muxFrameNew(1, "example.com", 80, payload)]));
+
+  const gotKeep = await until(() => {
+    const parsed = parseMuxFrames(received().subarray(2));
+    return parsed.frames.some((frame) => frame.status === 2 && frame.data.length >= 6);
+  }, 8000);
+  const all = received();
+  const headerOk = all.length >= 2 && all[0] === 0x00 && all[1] === 0x00;
+  const frames = parseMuxFrames(all.subarray(2)).frames;
+  const keep = frames.find((frame) => frame.status === 2);
+  const dataOk = !!keep && keep.id === 1 && keep.data.subarray(0, 2).toString("hex") === "5566" &&
+    keep.data.subarray(2).toString("utf8") === "PING";
+
+  ws.send(muxFrameEnd(1));
+  const closed = await until(() => S.proxy.closes > closesBefore, 3000);
+
+  // Sesi kedua di koneksi mux yang SAMA: klien Xray membuka koneksi utama sekali lalu
+  // memakainya untuk banyak permintaan, jadi ini jalur yang paling sering dipakai.
+  S.proxy.echoed = false;
+  const beforeSecond = received().length;
+  ws.send(muxFrameNew(2, "example.com", 80, Buffer.from("PING2")));
+  const secondOk = await until(() => {
+    const parsed = parseMuxFrames(received().subarray(2));
+    return parsed.frames.some((frame) => frame.id === 2 && frame.status === 2 && frame.data.length >= 7);
+  }, 8000);
+  const frames2 = parseMuxFrames(received().subarray(2)).frames.filter((frame) => frame.id === 2);
+  const secondData = frames2.find((frame) => frame.status === 2);
+  const secondDataOk = !!secondData && secondData.data.subarray(0, 2).toString("hex") === "5566" &&
+    secondData.data.subarray(2).toString("utf8") === "PING2";
+  ws.send(muxFrameEnd(2));
+  try { ws.close(); } catch {}
+
+  return {
+    name: "Mux (cmd=3): frame New/Keep/End diteruskan lewat proxy",
+    pass: gotKeep && headerOk && dataOk && closed && secondOk && secondDataOk,
+    detail: `keep=${gotKeep} header=${headerOk} data=${dataOk} soketDitutup=${closed} sesi2=${secondOk} data2=${secondDataOk} frames=${JSON.stringify(frames.map((f) => ({ id: f.id, status: f.status, len: f.data.length })))}`,
+  };
+}
+
+// --- klien mux.cool minimal (untuk regresi lokal jalur mux) ------------------------------
+// Header VLESS cmd=3 tanpa alamat, lalu frame: [2B metaLen][meta][2B dataLen][data].
+function muxVlessHeader() {
+  return Buffer.concat([Buffer.from([0x00]), Buffer.from(UUID_HEX, "hex"), Buffer.from([0x00, 0x03])]);
+}
+
+function muxFrameNew(id, host, port, data) {
+  const hostBytes = Buffer.from(host, "utf8");
+  const meta = Buffer.concat([
+    Buffer.from([(id >> 8) & 0xff, id & 0xff, 0x01, 0x01, 0x01, (port >> 8) & 0xff, port & 0xff, 0x02, hostBytes.length]),
+    hostBytes,
+  ]);
+  return Buffer.concat([
+    Buffer.from([(meta.length >> 8) & 0xff, meta.length & 0xff]),
+    meta,
+    Buffer.from([(data.length >> 8) & 0xff, data.length & 0xff]),
+    data,
+  ]);
+}
+
+function muxFrameKeep(id, data) {
+  const meta = Buffer.from([(id >> 8) & 0xff, id & 0xff, 0x02, 0x01]);
+  return Buffer.concat([
+    Buffer.from([(meta.length >> 8) & 0xff, meta.length & 0xff]),
+    meta,
+    Buffer.from([(data.length >> 8) & 0xff, data.length & 0xff]),
+    data,
+  ]);
+}
+
+function muxFrameEnd(id) {
+  const meta = Buffer.from([(id >> 8) & 0xff, id & 0xff, 0x03, 0x00]);
+  return Buffer.concat([Buffer.from([0x00, 0x04]), meta]);
+}
+
+// Urai frame mux dari buffer (kembalikan daftar frame + sisa byte).
+function parseMuxFrames(buf) {
+  const frames = [];
+  let offset = 0;
+  while (buf.length - offset >= 2) {
+    const metaLen = (buf[offset] << 8) | buf[offset + 1];
+    if (metaLen < 4 || metaLen > 512 || buf.length - offset < 2 + metaLen) break;
+    const meta = buf.subarray(offset + 2, offset + 2 + metaLen);
+    const frame = { id: (meta[0] << 8) | meta[1], status: meta[2], opt: meta[3], data: Buffer.alloc(0) };
+    let consumed = 2 + metaLen;
+    if (frame.opt & 0x01) {
+      if (buf.length - offset < consumed + 2) break;
+      const dataLen = (buf[offset + consumed] << 8) | buf[offset + consumed + 1];
+      if (buf.length - offset < consumed + 2 + dataLen) break;
+      frame.data = buf.subarray(offset + consumed + 2, offset + consumed + 2 + dataLen);
+      consumed += 2 + dataLen;
+    }
+    frames.push(frame);
+    offset += consumed;
+  }
+  return { frames: frames, rest: buf.subarray(offset) };
 }
 
 function tierCheck() {
@@ -865,7 +1120,7 @@ const workers = [];
 try {
   if (!fs.existsSync(WRANGLER)) throw new Error(`wrangler tidak ada di ${WRANGLER} — jalankan npm install dulu`);
   const dohStub = await startDoh();
-  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startSocks(), await startSilentProxy(), await startPoolStub(), dohStub);
+  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startSocks(), await startSilentProxy(), await startRaceProxy(), await startStreamProxy(), await startPoolStub(), dohStub);
 
   workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-")));
   makeFixture(workdirs[0], {
@@ -897,6 +1152,10 @@ try {
   results.push(await scenarioFailover());
   results.push(await scenarioNoFailoverWhenHealthy());
   results.push(await scenarioDnsNegativeCache());
+  results.push(await scenarioEarlyDataQuery());
+  results.push(await scenarioProxyRace());
+  results.push(await scenarioBatching(PORT, true));
+  results.push(await scenarioMux(PORT));
   results.push(await scenarioHealth(PORT));
 
   // Worker kedua: endpoint DoH utama sengaja mati supaya jalur fallback dan SERVFAIL teruji,
@@ -922,6 +1181,7 @@ try {
   makeFixture(workdirs[2], {
     DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
     IDLE_CLOSE_SECONDS: "1",
+    WS_BATCH_MS: "0", // dipakai pembanding uji batching
     FALLBACK_POOL: "off",
   });
   workers.push(startWorker(workdirs[2], PORT_IDLE));
@@ -929,6 +1189,8 @@ try {
     throw new Error("wrangler dev (uji watchdog) tidak siap pada port " + PORT_IDLE + "\n" + workers[2].getOut().slice(-1500));
   }
   results.push(await scenarioWatchdog(PORT_IDLE));
+  results.push(await scenarioBatching(PORT_IDLE, false));
+  results.push(await scenarioLogGate(PORT_IDLE));
 
   // Worker keempat: failover dari pool (REST proxy_pool palsu di 7309, tanpa daftar statis).
   workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-pool-")));

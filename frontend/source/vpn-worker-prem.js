@@ -46,6 +46,12 @@ const FALLBACK_FETCH_TIMEOUT = 2500;
 // Ini lebih baik daripada memendekkan timeout proxy utama: proxy lambat tapi sehat tetap
 // boleh menang, sedangkan proxy yang diam/mati tidak lagi menahan belasan detik.
 const HEDGE_DELAY_MS = 1500;
+
+// Batching socket->WebSocket: potongan yang datang berdekatan digabung jadi satu pesan
+// (hemat frame + CPU di worker dan klien). Ambang ukuran dan jendela waktu kecil supaya
+// trafik interaktif tidak terasa; WS_BATCH_MS=0 mematikan batching.
+const BATCH_BYTES_DEFAULT = 16384;
+const BATCH_MS_DEFAULT = 2;
 const SUPABASE_URL = "https://lumbbmhhmkcnxunuryjr.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1bWJibWhobWtjbnh1bnVyeWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0NzI1MjEsImV4cCI6MjExMDA0ODUyMX0.ylMqMgv2H4vWax-whnXSRHBlD7DZs9DXVRUD9fAO6mc";
 let fallbackCache = { at: 0, list: [] };
@@ -56,6 +62,38 @@ let fallbackUses = 0;
 // IDLE_CLOSE_SECONDS, koneksi ditutup rapi supaya klien cepat pindah (proxy "setengah mati"
 // sebelumnya menggantung sampai CDN memutus). 0 = mati.
 const IDLE_CLOSE_DEFAULT = 180;
+
+// Versi template: muncul di /health supaya panel bisa memastikan worker mana yang sudah
+// memakai kode terbaru.
+const WORKER_VERSION = "2026-11-13";
+
+// Log dibatasi per jenis pesan: hitungan tetap akurat (muncul di /health) tetapi Workers Logs
+// tidak dibanjiri ketika pool proxy sedang banyak yang mati.
+const LOG_MIN_INTERVAL_MS = 5000;
+const logSeen = new Map();
+const counters = {
+  proxyFail: 0,
+  fallbackUsed: 0,
+  fallbackFail: 0,
+  poolFail: 0,
+  pipeError: 0,
+  watchdog: 0,
+  udpUnsupported: 0,
+  dohFail: 0,
+  muxError: 0,
+};
+// Berapa baris log yang benar-benar ditulis per jenis (sisanya ditahan gate). Dibedakan dari
+// `counters` supaya efektivitas gate bisa dipantau dari /health, bukan dari logs.
+const logEmitted = {};
+
+function logLimited(key, message) {
+  counters[key] = (counters[key] || 0) + 1;
+  const now = Date.now();
+  if (now - (logSeen.get(key) || 0) < LOG_MIN_INTERVAL_MS) return;
+  logSeen.set(key, now);
+  logEmitted[key] = (logEmitted[key] || 0) + 1;
+  console.log("[v" + WORKER_VERSION + "] " + key + " #" + counters[key] + " — " + message);
+}
 
 // Cache jawaban DoH per-isolate: setiap query DNS normalnya satu subrequest fetch, dan
 // penjelajahan biasa butuh puluhan query untuk domain yang sama berulang kali. TTL dari
@@ -92,6 +130,9 @@ export default {
             dns_cache: dnsCache.size,
             dns_hits: { memory: dnsMemoryHits, shared: dnsSharedHits, miss: dnsCacheMisses },
             proxy_memo: proxyProtocols.size,
+            version: WORKER_VERSION,
+            counters: counters,
+            log_emitted: logEmitted,
           }),
           { headers: { ...CORS, "Content-Type": "application/json" } }
         );
@@ -144,12 +185,17 @@ async function websocketHandler(request, prx, env) {
   // Basis URL untuk Cache API (lapisan cache DNS lintas-isolate) — memakai host sendiri
   // supaya kuncinya berada di zone ini.
   state.cacheBase = new URL(request.url).origin;
+  state.batchBytes = Number((env && env.WS_BATCH_BYTES) || BATCH_BYTES_DEFAULT);
+  state.batchMs = Number((env && env.WS_BATCH_MS) || BATCH_MS_DEFAULT);
   // Hangatkan daftar cadangan di latar belakang supaya failover tidak ikut menunggu fetch
   // tepat saat proxy utama sudah gagal.
   if (Date.now() - fallbackCache.at > FALLBACK_TTL_MS) {
     poolFallbacks(env).catch(function () {});
   }
-  const earlyData = request.headers.get("sec-websocket-protocol") || "";
+  // Early data: klien bisa menaruh paket pertama di header `sec-websocket-protocol` (gaya
+  // Xray earlyDataHeaderName) atau di query `?ed=` berisi base64url. Nilai numerik kecil
+  // (mis. ?ed=2048) hanya petunjuk ukuran, bukan data.
+  const earlyData = earlyDataValue(request);
 
   const incoming = new ReadableStream({
     start(controller) {
@@ -172,12 +218,14 @@ async function websocketHandler(request, prx, env) {
         }
       });
       webSocket.addEventListener("close", function () {
+        stopIdleWatch(state);
         if (!state.cancelled) {
           try { controller.close(); } catch (err) {}
         }
         safeClose(webSocket);
       });
       webSocket.addEventListener("error", function () {
+        stopIdleWatch(state);
         if (!state.cancelled) {
           try { controller.error(new Error("ws error")); } catch (err) {}
         }
@@ -186,6 +234,7 @@ async function websocketHandler(request, prx, env) {
     },
     cancel() {
       state.cancelled = true;
+      stopIdleWatch(state);
       shutdownRemote(state, false);
     },
   });
@@ -212,6 +261,12 @@ async function websocketHandler(request, prx, env) {
 
 async function handleClientChunk(chunk, state, webSocket, prx, env) {
   state.clientSent = true;
+  // Sekali koneksi masuk mode mux, SEMUA potongan berikutnya adalah frame mux — jangan
+  // di-parse ulang sebagai header VLESS (itu yang dulu langsung menutup koneksi).
+  if (state.mux) {
+    muxHandle(state, webSocket, prx, env, toBytes(chunk));
+    return;
+  }
   if (state.remote) {
     await writeToRemote(state, chunk);
     return;
@@ -251,11 +306,16 @@ async function handleClientChunk(chunk, state, webSocket, prx, env) {
     return;
   }
 
+  if (header.isMux) {
+    muxHandle(state, webSocket, prx, env, new Uint8Array(header.rawClientData));
+    return;
+  }
+
   if (header.isUDP) {
     if (header.portRemote !== 53) {
       // Workers tidak punya UDP keluar, dan relay UDP eksternal sudah tidak tersedia,
       // jadi UDP selain DNS ditutup cepat dengan alasan yang jelas (bukan menggantung).
-      console.log("udp port " + header.portRemote + " tidak didukung");
+      logLimited("udpUnsupported", "port " + header.portRemote + " tidak didukung");
       safeClose(webSocket);
       return;
     }
@@ -370,7 +430,7 @@ async function handleDnsQuery(message, state, webSocket, env) {
   } catch (err) {
     // Semua endpoint DoH gagal: balas SERVFAIL supaya klien tahu saat itu juga dan tidak
     // menunggu timeout-nya sendiri (sebelumnya balasan tidak dikirim sama sekali).
-    console.log("doh gagal: " + (err && err.message));
+    logLimited("dohFail", String(err && err.message));
     answer = servfailResponse(message);
     if (!answer) return;
   }
@@ -629,6 +689,21 @@ function withTimeout(promise, ms) {
   });
 }
 
+// Early data bisa datang dari header `sec-websocket-protocol` (gaya Xray) atau query `?ed=`.
+// Nilai yang seluruhnya angka (mis. ?ed=2048) adalah petunjuk ukuran, bukan data.
+function earlyDataValue(request) {
+  const header = request.headers.get("sec-websocket-protocol");
+  if (header) return header;
+  let raw = "";
+  try {
+    raw = new URL(request.url).searchParams.get("ed") || "";
+  } catch (err) {
+    return "";
+  }
+  if (!raw || /^\d+$/.test(raw)) return "";
+  return raw;
+}
+
 // Path dari klien: "/<proxy-host>-<port>" atau "/<proxy-host>:<port>". Pemisah port dibaca
 // dari kanan, jadi alamat IPv6 (yang memuat ":") juga terbaca benar.
 function splitProxy(raw) {
@@ -767,7 +842,7 @@ async function tryViaProxy(header, webSocket, state, prx, env) {
     await establishTunnel(prx, header, webSocket, state, PROXY_HANDSHAKE_TIMEOUT);
     return;
   } catch (err) {
-    console.log("proxy gagal: " + err.message + " (" + prx.host + ":" + prx.port + ")");
+    logLimited("proxyFail", err.message + " (" + prx.host + ":" + prx.port + ")");
   } finally {
     clearTimeout(hedge);
   }
@@ -808,7 +883,7 @@ async function runFallbacks(header, webSocket, state, env, prx) {
   try {
     candidates = await fallbackCandidates(prx, env);
   } catch (err) {
-    console.log("daftar cadangan gagal: " + (err && err.message));
+    logLimited("poolFail", String(err && err.message));
     return false;
   }
   for (const candidate of candidates) {
@@ -816,10 +891,10 @@ async function runFallbacks(header, webSocket, state, env, prx) {
     try {
       await establishTunnel(candidate, header, webSocket, state, PROXY_HANDSHAKE_TIMEOUT);
       fallbackUses++;
-      console.log("fallback dipakai: " + candidate.host + ":" + candidate.port);
+      logLimited("fallbackUsed", candidate.host + ":" + candidate.port);
       return true;
     } catch (err) {
-      console.log("fallback gagal: " + candidate.host + ":" + candidate.port + " — " + err.message);
+      logLimited("fallbackFail", candidate.host + ":" + candidate.port + " — " + err.message);
     }
   }
   return false;
@@ -875,7 +950,7 @@ async function fetchPoolProxies(env) {
         .filter(function (proxy) { return proxy.host && proxy.port; }),
     };
   } catch (err) {
-    console.log("proxy_pool gagal: " + (err && err.message));
+    logLimited("poolFail", String(err && err.message));
     fallbackCache = { at: Date.now(), list: fallbackCache.list };
   }
   return fallbackCache.list;
@@ -899,8 +974,21 @@ async function fallbackCandidates(prx, env) {
 }
 
 async function openProxyTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+  const known = proxyProtocols.get(proxyHost + ":" + proxyPort);
+  if (known === "http") {
+    return await orderedProxyTunnel("http", proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
+  }
+  if (known === "socks5") {
+    return await orderedProxyTunnel("socks5", proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
+  }
+  return await raceProxyProtocols(proxyHost, proxyPort, targetHost, targetPort, timeoutMs);
+}
+
+// Protokol yang sudah diketahui: dicoba berurutan (yang diingat lebih dulu).
+async function orderedProxyTunnel(first, proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
   const errors = [];
-  for (const protocol of proxyProtocolOrder(proxyHost, proxyPort)) {
+  const order = first === "http" ? ["http", "socks5"] : ["socks5", "http"];
+  for (const protocol of order) {
     try {
       const tunnel = protocol === "socks5"
         ? await socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs)
@@ -914,10 +1002,38 @@ async function openProxyTunnel(proxyHost, proxyPort, targetHost, targetPort, tim
   throw new Error(errors.join(" | "));
 }
 
-// Protokol yang terakhir berhasil di proxy ini dicoba lebih dulu: proxy HTTP-only tidak lagi
-// membayar satu koneksi + satu round trip SOCKS5 di setiap koneksi baru.
-function proxyProtocolOrder(host, port) {
-  return proxyProtocols.get(host + ":" + port) === "http" ? ["http", "socks5"] : ["socks5", "http"];
+// Proxy yang protokolnya belum diketahui: SOCKS5 dan HTTP CONNECT dicoba BERSAMAAN, yang
+// pertama berhasil dipakai dan soket yang kalah ditutup. Hanya terjadi sekali per proxy per
+// isolate (setelah itu memo `proxyProtocols` yang menentukan), jadi proxy HTTP-only tidak
+// perlu membayar penuh probe SOCKS5 sementara proxy SOCKS5 tidak dirugikan.
+async function raceProxyProtocols(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+  const race = { sockets: new Set() };
+  const errors = [];
+  const guard = function (promise, label) {
+    return promise.then(function (tunnel) {
+      return { tunnel: tunnel, protocol: label };
+    }, function (err) {
+      errors.push(label + ": " + (err && err.message));
+      throw err;
+    });
+  };
+
+  let winner;
+  try {
+    winner = await Promise.any([
+      guard(socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs, race), "socks5"),
+      guard(httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs, race), "http"),
+    ]);
+  } catch (err) {
+    throw new Error(errors.join(" | ") || "socks5/http gagal");
+  }
+
+  rememberProxyProtocol(proxyHost, proxyPort, winner.protocol);
+  for (const sock of race.sockets) {
+    if (sock === winner.tunnel.socket) continue;
+    try { sock.close(); } catch (e) {}
+  }
+  return winner.tunnel;
 }
 
 function rememberProxyProtocol(host, port, protocol) {
@@ -929,8 +1045,9 @@ function rememberProxyProtocol(host, port, protocol) {
   proxyProtocols.set(key, protocol);
 }
 
-async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs, race) {
   const sock = connect({ hostname: proxyHost, port: proxyPort, secureTransport: "off" });
+  if (race) race.sockets.add(sock);
   const writer = sock.writable.getWriter();
   const reader = sock.readable.getReader();
 
@@ -990,8 +1107,9 @@ async function socks5Tunnel(proxyHost, proxyPort, targetHost, targetPort, timeou
   }
 }
 
-async function httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs) {
+async function httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeoutMs, race) {
   const sock = connect({ hostname: proxyHost, port: proxyPort, secureTransport: "off" });
+  if (race) race.sockets.add(sock);
   const writer = sock.writable.getWriter();
   const reader = sock.readable.getReader();
 
@@ -1054,7 +1172,7 @@ function rebuildTunnel(sock, reader, leftover, writer) {
     },
   });
 
-  return { readable: readable, writable: writable, close: function () { sock.close(); } };
+  return { readable: readable, writable: writable, close: function () { sock.close(); }, socket: sock };
 }
 
 // Satu pembacaan dengan batas waktu; timernya selalu dibersihkan supaya handshake proxy
@@ -1151,7 +1269,21 @@ function parseVlessHeader(view) {
   if (view.length < cmdIndex + 1) return { need: cmdIndex + 1 };
 
   const cmd = view[cmdIndex];
-  if (cmd !== 1 && cmd !== 2) return { invalid: "cmd " + cmd };
+  if (cmd !== 1 && cmd !== 2 && cmd !== 3) return { invalid: "cmd " + cmd };
+
+  // cmd=3 = Mux (mux.cool): tidak ada port/atyp/alamat di header VLESS; sisanya adalah frame
+  // mux. Ini penanda yang dipakai Xray, jadi tidak perlu tebak-tebakan.
+  if (cmd === 3) {
+    return {
+      header: {
+        uuidBytes: view.subarray(1, 17),
+        isMux: true,
+        isUDP: false,
+        rawClientData: view.slice(cmdIndex + 1),
+        version: new Uint8Array([version, 0]),
+      },
+    };
+  }
 
   const portIndex = cmdIndex + 1;
   const atypIndex = portIndex + 2;
@@ -1202,6 +1334,285 @@ function parseVlessHeader(view) {
   };
 }
 
+// --- mux.cool (Xray Mux) ------------------------------------------------------------
+// Format diambil dari klien Xray asli (diverifikasi lewat tests/mux-probe.mjs):
+//   [2B metaLen][meta][2B dataLen][data]
+// Dua byte panjang data hanya ada kalau opt punya bit 0x01 (Opt D). meta:
+//   [2B id][1B status][1B opt] lalu untuk New (dan Keep XUDP): [1B network][2B port][1B atyp][addr]
+// XUDP menambah 8 byte Global ID. status: 1=New, 2=Keep, 3=End, 4=KeepAlive.
+// Kehadiran cmd=3 di header VLESS sudah cukup sebagai penanda mux (tanpa tebak-tebakan).
+const MUX_STATUS_NEW = 1;
+const MUX_STATUS_KEEP = 2;
+const MUX_STATUS_END = 3;
+const MUX_STATUS_KEEPALIVE = 4;
+const MUX_OPT_DATA = 0x01;
+const MUX_MAX_META = 512;
+const MUX_MAX_SESSIONS = 64;
+
+function muxEnabled(env) {
+  return String((env && env.MUX) || "auto").toLowerCase() !== "off";
+}
+
+function parseMuxAddress(bytes, offset, atyp) {
+  if (atyp === 1) {
+    if (bytes.length < offset + 4) return null;
+    return { address: [bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]].join("."), offset: offset + 4 };
+  }
+  if (atyp === 2) {
+    if (bytes.length < offset + 1) return null;
+    const length = bytes[offset];
+    if (bytes.length < offset + 1 + length) return null;
+    return { address: new TextDecoder().decode(bytes.subarray(offset + 1, offset + 1 + length)), offset: offset + 1 + length };
+  }
+  if (atyp === 3) {
+    if (bytes.length < offset + 16) return null;
+    const parts = [];
+    for (let i = 0; i < 8; i++) {
+      parts.push(((bytes[offset + i * 2] << 8) | bytes[offset + i * 2 + 1]).toString(16));
+    }
+    return { address: parts.join(":"), offset: offset + 16 };
+  }
+  return null;
+}
+
+function parseMuxMeta(meta) {
+  if (meta.length < 4) return null;
+  const frame = {
+    id: (meta[0] << 8) | meta[1],
+    status: meta[2],
+    opt: meta[3],
+    network: 0,
+    port: 0,
+    address: "",
+    globalId: null,
+  };
+  if (frame.status < MUX_STATUS_NEW || frame.status > MUX_STATUS_KEEPALIVE) return null;
+
+  const hasTarget = frame.status === MUX_STATUS_NEW ||
+    (frame.status === MUX_STATUS_KEEP && meta.length > 4 && meta[4] === 2);
+  if (hasTarget) {
+    if (meta.length < 8) return null;
+    frame.network = meta[4];
+    frame.port = (meta[5] << 8) | meta[6];
+    const parsed = parseMuxAddress(meta, 8, meta[7]);
+    if (!parsed) return null;
+    frame.address = parsed.address;
+    if (frame.network === 2 && meta.length >= parsed.offset + 8) {
+      frame.globalId = meta.subarray(parsed.offset, parsed.offset + 8);
+    }
+  }
+  return frame;
+}
+
+function muxFrameBytes(id, status, opt, data) {
+  const metaLen = 4; // id(2) + status(1) + opt(1)
+  const payload = opt & MUX_OPT_DATA ? data || new Uint8Array(0) : new Uint8Array(0);
+  const out = new Uint8Array(2 + metaLen + (opt & MUX_OPT_DATA ? 2 + payload.length : 0));
+  out[0] = (metaLen >> 8) & 0xff;
+  out[1] = metaLen & 0xff;
+  out[2] = (id >> 8) & 0xff;
+  out[3] = id & 0xff;
+  out[4] = status;
+  out[5] = opt;
+  if (opt & MUX_OPT_DATA) {
+    out[6] = (payload.length >> 8) & 0xff;
+    out[7] = payload.length & 0xff;
+    out.set(payload, 8);
+  }
+  return out;
+}
+
+function muxSend(state, webSocket, id, data) {
+  if (webSocket.readyState !== WS_OPEN) return;
+  const frame = data && data.length
+    ? muxFrameBytes(id, MUX_STATUS_KEEP, MUX_OPT_DATA, data)
+    : muxFrameBytes(id, MUX_STATUS_KEEP, 0, null);
+  if (state.mux && state.mux.batcher) state.mux.batcher.push(frame);
+  else webSocket.send(frame);
+}
+
+function muxSendEnd(state, webSocket, id) {
+  if (webSocket.readyState !== WS_OPEN) return;
+  const frame = muxFrameBytes(id, MUX_STATUS_END, 0, null);
+  if (state.mux && state.mux.batcher) state.mux.batcher.push(frame);
+  else webSocket.send(frame);
+}
+
+function muxHandle(state, webSocket, prx, env, bytes) {
+  if (!muxEnabled(env)) {
+    safeClose(webSocket);
+    return;
+  }
+  if (!state.mux) {
+    state.mux = { buf: new Uint8Array(0), sessions: new Map(), headerSent: false, batcher: createWsBatcher(webSocket, state) };
+  }
+  const mux = state.mux;
+  if (!mux.headerSent) {
+    mux.headerSent = true;
+    if (webSocket.readyState === WS_OPEN) webSocket.send(state.versionBytes || new Uint8Array([0, 0]));
+  }
+  mux.buf = concatBytes(mux.buf, bytes);
+
+  for (;;) {
+    if (mux.buf.length < 2) return;
+    const metaLen = (mux.buf[0] << 8) | mux.buf[1];
+    if (metaLen < 4 || metaLen > MUX_MAX_META) {
+      logLimited("muxError", "metaLen " + metaLen);
+      safeClose(webSocket);
+      return;
+    }
+    if (mux.buf.length < 2 + metaLen) return;
+    const frame = parseMuxMeta(mux.buf.subarray(2, 2 + metaLen));
+    if (!frame) {
+      logLimited("muxError", "meta tidak valid");
+      safeClose(webSocket);
+      return;
+    }
+    let consumed = 2 + metaLen;
+    let data = new Uint8Array(0);
+    if (frame.opt & MUX_OPT_DATA) {
+      if (mux.buf.length < consumed + 2) return;
+      const dataLen = (mux.buf[consumed] << 8) | mux.buf[consumed + 1];
+      if (mux.buf.length < consumed + 2 + dataLen) return;
+      data = mux.buf.subarray(consumed + 2, consumed + 2 + dataLen);
+      consumed += 2 + dataLen;
+    }
+    mux.buf = mux.buf.subarray(consumed);
+
+    if (frame.status === MUX_STATUS_KEEPALIVE) continue;
+    if (frame.status === MUX_STATUS_END) {
+      muxCloseSession(state, webSocket, frame.id, false);
+      continue;
+    }
+    if (frame.status === MUX_STATUS_NEW) {
+      muxNewSession(state, webSocket, prx, env, frame, data);
+      continue;
+    }
+    muxKeepSession(state, webSocket, env, frame, data);
+  }
+}
+
+function muxKeepSession(state, webSocket, env, frame, data) {
+  const session = state.mux.sessions.get(frame.id);
+  if (!session) return;
+  if (session.udp) {
+    if (data.length) muxUdpQuery(state, webSocket, env, frame.id, frame, data).catch(function () {});
+    return;
+  }
+  muxWriteSession(session, data).catch(function (err) {
+    logLimited("muxError", "tulis sesi " + frame.id + " — " + (err && err.message));
+  });
+}
+
+function muxNewSession(state, webSocket, prx, env, frame, data) {
+  if (state.mux.sessions.size >= MUX_MAX_SESSIONS) {
+    muxSendEnd(state, webSocket, frame.id);
+    return;
+  }
+  if (frame.network === 2) {
+    // XUDP (UDP lewat mux): Workers tidak punya UDP keluar, jadi hanya DNS yang dijawab.
+    state.mux.sessions.set(frame.id, { id: frame.id, udp: true });
+    if (data.length) muxUdpQuery(state, webSocket, env, frame.id, frame, data).catch(function () {});
+    return;
+  }
+
+  const session = { id: frame.id, udp: false, tunnel: null, writer: null, closed: false };
+  state.mux.sessions.set(frame.id, session);
+  muxOpenTunnel(prx, frame.address, frame.port, env)
+    .then(function (tunnel) {
+      if (session.closed || !state.mux.sessions.has(frame.id)) {
+        try { tunnel.close(); } catch (e) {}
+        return;
+      }
+      session.tunnel = tunnel;
+      muxPipeSession(state, webSocket, session);
+      if (data.length) return muxWriteSession(session, data);
+    })
+    .catch(function (err) {
+      logLimited("muxError", "tunnel " + frame.address + ":" + frame.port + " — " + (err && err.message));
+      muxCloseSession(state, webSocket, frame.id, true);
+    });
+}
+
+async function muxWriteSession(session, data) {
+  if (!session.tunnel || session.closed) return;
+  if (!session.writer) session.writer = session.tunnel.writable.getWriter();
+  await session.writer.write(data);
+}
+
+function muxPipeSession(state, webSocket, session) {
+  const batcher = state.mux.batcher;
+  session.tunnel.readable
+    .pipeTo(new WritableStream({
+      write(chunk) {
+        if (session.closed || webSocket.readyState !== WS_OPEN) return;
+        state.lastRemoteData = Date.now();
+        batcher.push(muxFrameBytes(session.id, MUX_STATUS_KEEP, MUX_OPT_DATA, chunk));
+      },
+      close() {},
+      abort() {},
+    }))
+    .catch(function () {})
+    .then(function () {
+      muxCloseSession(state, webSocket, session.id, true);
+    });
+}
+
+function muxCloseSession(state, webSocket, id, notify) {
+  const session = state.mux ? state.mux.sessions.get(id) : null;
+  if (!session) return;
+  state.mux.sessions.delete(id);
+  session.closed = true;
+  const writer = session.writer;
+  const tunnel = session.tunnel;
+  session.writer = null;
+  session.tunnel = null;
+  if (writer) {
+    try { writer.releaseLock(); } catch (e) {}
+  }
+  if (tunnel) {
+    try { tunnel.close(); } catch (e) {}
+  }
+  if (notify && webSocket) muxSendEnd(state, webSocket, id);
+}
+
+// Buka tunnel untuk satu sub-koneksi mux: proxy utama dulu, lalu cadangan (sama seperti jalur
+// non-mux, tanpa hedge karena sub-koneksi murah dan klien bisa membukanya lagi).
+async function muxOpenTunnel(prx, target, port, env) {
+  try {
+    return await openProxyTunnel(prx.host, prx.port, target, port, PROXY_HANDSHAKE_TIMEOUT);
+  } catch (err) {
+    const candidates = await fallbackCandidates(prx, env).catch(function () { return []; });
+    for (const candidate of candidates) {
+      try {
+        return await openProxyTunnel(candidate.host, candidate.port, target, port, PROXY_HANDSHAKE_TIMEOUT);
+      } catch (e) {
+        // coba cadangan berikutnya
+      }
+    }
+    throw err;
+  }
+}
+
+// XUDP: datagram dibalas dengan panjang 2 byte di depan (format XUDP), dan hanya DNS yang
+// bisa dilayani karena Workers tidak punya UDP keluar.
+async function muxUdpQuery(state, webSocket, env, id, frame, data) {
+  if (frame.port !== 53) {
+    muxCloseSession(state, webSocket, id, true);
+    return;
+  }
+  try {
+    const answer = await resolveDohCoalesced(dnsCacheKey(data), data, env);
+    const framed = new Uint8Array(2 + answer.length);
+    framed[0] = (answer.length >> 8) & 0xff;
+    framed[1] = answer.length & 0xff;
+    framed.set(answer, 2);
+    muxSend(state, webSocket, id, framed);
+  } catch (err) {
+    logLimited("dohFail", String(err && err.message));
+  }
+}
+
 function toBytes(chunk) {
   if (typeof chunk === "string") return new TextEncoder().encode(chunk);
   if (chunk instanceof Uint8Array) return chunk;
@@ -1231,32 +1642,77 @@ function isUuidAllowed(uuidBytes, env) {
 }
 
 async function pipeRemoteToWs(remote, webSocket, state) {
+  const batcher = createWsBatcher(webSocket, state);
   try {
     await remote.readable.pipeTo(new WritableStream({
-      async write(chunk) {
-        state.lastRemoteData = Date.now();
-        if (webSocket.readyState !== WS_OPEN) return;
-        webSocket.send(chunk);
+      write(chunk) {
+        batcher.push(chunk);
       },
       close() {},
       abort(reason) {
-        console.log("pipe abort: " + reason);
+        logLimited("pipeError", "abort: " + reason);
       },
     }));
   } catch (err) {
-    console.log("pipe error: " + (err && err.message));
+    logLimited("pipeError", String(err && err.message));
     stopIdleWatch(state);
     shutdownRemote(state, false);
     safeClose(webSocket);
     return;
   }
 
-  // Target sudah menutup koneksi: lepaskan state supaya potongan berikutnya dari klien tidak
-  // menulis ke soket mati, lalu tutup WebSocket agar klien tidak menggantung.
+  batcher.flush();
   stopIdleWatch(state);
   state.remote = null;
   state.remoteWriter = null;
   safeClose(webSocket);
+}
+
+// Penggabung potongan socket -> WebSocket. Urutan tetap terjaga (send selalu berurutan) dan
+// potongan kecil yang datang berdekatan dikirim dalam satu pesan; dengan WS_BATCH_MS=0
+// perilakunya kembali menjadi satu pesan per potongan.
+function createWsBatcher(webSocket, state) {
+  const limit = state.batchBytes;
+  const waitMs = state.batchMs;
+  let parts = [];
+  let bytes = 0;
+  let timer = null;
+
+  function flush() {
+    if (!parts.length) return;
+    let out;
+    if (parts.length === 1) {
+      out = parts[0];
+    } else {
+      out = new Uint8Array(bytes);
+      let offset = 0;
+      for (const part of parts) {
+        out.set(part, offset);
+        offset += part.length;
+      }
+    }
+    parts = [];
+    bytes = 0;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (webSocket.readyState === WS_OPEN) webSocket.send(out);
+  }
+
+  return {
+    push(chunk) {
+      state.lastRemoteData = Date.now();
+      parts.push(chunk);
+      bytes += chunk.length;
+      if (!limit || !waitMs || bytes >= limit) {
+        flush();
+        return;
+      }
+      if (!timer) timer = setTimeout(flush, waitMs);
+    },
+    flush: flush,
+  };
 }
 
 // --- watchdog idle/half-open -------------------------------------------------------
@@ -1271,7 +1727,7 @@ function startIdleWatch(state, webSocket, env) {
     if (state.cancelled || !state.clientSent) return;
     const last = state.lastRemoteData || state.openedAt;
     if (Date.now() - last < limit) return;
-    console.log("watchdog: target tidak menjawab " + seconds + "s — koneksi ditutup");
+    logLimited("watchdog", "target tidak menjawab " + seconds + "s — koneksi ditutup");
     stopIdleWatch(state);
     shutdownRemote(state, false);
     safeClose(webSocket, 1001, "target tidak menjawab");
