@@ -14,6 +14,9 @@ const DEADLINE_MS = 18000;
 const ROW_BUDGET_MS = 9000;
 const CHECK_TIMEOUT_MS = 5000;
 const TUNNEL_TIMEOUT_MS = 6000; // per koneksi: HTTP CONNECT dulu, lalu SOCKS5 kalau gagal
+// 4 s: cukup longgar untuk proxy lambat-tapi-sehat (cek dasar sendiri berbatas 5 s) dan cukup
+// ketat untuk proxy blackhole. Sempat dicoba 2,5 s; tidak dipakai karena bisa menandai proxy
+// lambat sebagai mati padahal worker ini mematikan baris.
 const CONNECT_TIMEOUT_MS = 4000; // hanya menjaga pembukaan soket (lihat guardedConnect)
 
 // Kolom bukti tunnel (sql/2026-11-14-proxy-tunnel-columns.sql). Selama migrasi belum

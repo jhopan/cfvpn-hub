@@ -191,6 +191,9 @@ async function checkAuth() {
   return true;
 }
 
+// State per user: dua fase seperti auth. Setelah sql/2026-11-14-state-hardening.sql, tabel
+// user_states tidak bisa dibaca/ditulis anon dan semuanya lewat RPC yang memverifikasi hash
+// pemiliknya — jadi sesi palsu tidak bisa menimpa daftar worker user lain.
 async function loadState() {
   if (!currentUser) return;
   const stateId = currentUser.username;
@@ -198,14 +201,24 @@ async function loadState() {
   if (!supabase) {
     const saved = localStorage.getItem(`state-${stateId}`);
     state = saved ? { ...emptyState, ...JSON.parse(saved) } : { ...emptyState };
-  } else {
-    const { data } = await supabase.from('user_states').select('state_data').eq('username', stateId).maybeSingle();
-    if (data && data.state_data) {
-      state = { ...emptyState, ...data.state_data };
-    } else {
+    return;
+  }
+
+  if (currentUser.hash) {
+    const viaRpc = await supabase.rpc("get_state", { p_username: stateId, p_actor_hash: currentUser.hash });
+    if (!viaRpc.error) {
+      state = viaRpc.data ? { ...emptyState, ...viaRpc.data } : { ...emptyState };
+      return;
+    }
+    if (!rpcMissing(viaRpc.error)) {
+      console.warn("get_state ditolak:", rpcErrorMessage(viaRpc.error));
       state = { ...emptyState };
+      return;
     }
   }
+
+  const { data } = await supabase.from('user_states').select('state_data').eq('username', stateId).maybeSingle();
+  state = data && data.state_data ? { ...emptyState, ...data.state_data } : { ...emptyState };
 }
 
 async function saveState() {
@@ -214,13 +227,23 @@ async function saveState() {
 
   if (!supabase) {
     localStorage.setItem(`state-${stateId}`, JSON.stringify(state));
-  } else {
-    await supabase.from('user_states').upsert({
-      username: stateId,
-      state_data: state,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'username' });
+    return;
   }
+
+  if (currentUser.hash) {
+    const viaRpc = await supabase.rpc("save_state", { p_username: stateId, p_actor_hash: currentUser.hash, p_state: state });
+    if (!viaRpc.error) return;
+    if (!rpcMissing(viaRpc.error)) {
+      console.warn("save_state ditolak:", rpcErrorMessage(viaRpc.error));
+      return;
+    }
+  }
+
+  await supabase.from('user_states').upsert({
+    username: stateId,
+    state_data: state,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'username' });
 }
 
 function typeLabel(type) { return type === "load_balancer" ? "Load Balancer" : "VPN Worker"; }
@@ -532,6 +555,12 @@ function proxyHealth(list, countries) {
     verified: fresh.filter((p) => p.tunnel === true).length,
     knownDead: fresh.filter((p) => p.tunnel === false).length,
     usable: fresh.filter((p) => p.tunnel !== false),
+    verified: fresh.filter((p) => p.tunnel === true),
+    // Kalau sudah ada cukup baris yang terbukti tembus tunnel, tawarkan hanya itu: baris yang
+    // belum pernah diprobe masih untung-untungan, dan cron hampir selalu mematikan separuhnya.
+    preferred: fresh.filter((p) => p.tunnel === true).length >= 2
+      ? fresh.filter((p) => p.tunnel === true)
+      : fresh.filter((p) => p.tunnel !== false),
   };
 }
 
@@ -592,7 +621,7 @@ function renderGenerator() {
   const populateProxies = () => {
     const cc = selectedCountries();
     const org = orgSelect.value;
-    const usable = proxyHealth(allProxies, cc).usable;
+    const usable = proxyHealth(allProxies, cc).preferred;
     const filtered = org ? usable.filter(p => p.org === org) : usable;
     proxySelect.innerHTML = `<option value="">Acak (${filtered.length} proxy siap pakai)</option>` + filtered.slice(0, 200).map(p => {
       return `<option value="${p.ip}:${p.port}">${getFlagEmoji(p.country)} ${p.ip}:${p.port} · ${escapeHtml(p.org)}${p.tunnel === true ? " ✓" : ""}</option>`;
@@ -718,7 +747,7 @@ function renderGenerator() {
           } else {
             // Hanya baris segar (< 6 jam) dan yang belum dinyatakan mati oleh probe tunnel;
             // proxy basi berarti config yang tidak akan tersambung.
-            const usable = proxyHealth(allProxies, ccList).usable;
+            const usable = proxyHealth(allProxies, ccList).preferred;
             customProxyList = (orgValue ? usable.filter(p => p.org === orgValue) : usable).map(p => p.ip + ":" + p.port);
           }
           if (!customProxyList.length) throw new Error("Tidak ada proxy segar untuk filter ini.");
@@ -959,6 +988,29 @@ async function hashPassword(password) {
   return [...new Uint8Array(hash)].map((item) => item.toString(16).padStart(2, "0")).join(""); 
 }
 
+// Endpoint auth di Pages Function (/api/login, /api/register) membatasi percobaan per IP dan
+// menaikkan batasnya jadi global lewat Supabase. Kalau endpoint itu belum ada (deploy lama) atau
+// menjawab 503 (RPC belum tersedia), panel jatuh ke jalur berikutnya: RPC langsung, lalu cara lama.
+async function postJson(url, payload, timeoutMs) {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs || 12000),
+    });
+    let data = null;
+    try { data = await res.json(); } catch {}
+    return { status: res.status, ok: res.ok, data };
+  } catch {
+    return null;
+  }
+}
+
+function throttleMessage(data) {
+  return (data && data.error) || "Terlalu banyak percobaan. Coba lagi nanti.";
+}
+
 // ---- Auth lewat RPC: sql/2026-11-14-auth-hardening.sql -------------------------------
 // Setelah SQL itu dijalankan, kolom password_hash tidak lagi bisa dibaca dengan anon key dan
 // tidak ada izin tulis mentah ke users_custom, jadi login/daftar/aksi admin lewat fungsi
@@ -1026,7 +1078,18 @@ function renderAuth() {
     const passwordHash = await hashPassword(password);
 
     if (supabase) {
-      // Server yang membuat akun beserta hash-nya; klien tidak mengirim/membaca password_hash.
+      // 1. Endpoint Function (dibatasi per IP; hanya boleh membuat role user di server).
+      const endpoint = await postJson("/api/register", { username, password });
+      if (endpoint && endpoint.ok && endpoint.data && endpoint.data.username) {
+        saveSession({ username: endpoint.data.username, role: "user" }, passwordHash);
+        location.href = "index.html";
+        return;
+      }
+      if (endpoint && endpoint.status === 409) return setMessage("registerMessage", "Username sudah terdaftar.", true);
+      if (endpoint && endpoint.status === 429) return setMessage("registerMessage", throttleMessage(endpoint.data), true);
+      if (endpoint && endpoint.status === 400) return setMessage("registerMessage", (endpoint.data && endpoint.data.error) || "Data tidak valid.", true);
+
+      // 2. RPC langsung (endpoint belum ada di deploy lama)
       const viaRpc = await supabase.rpc("register_user", { p_username: username, p_password: password });
       if (!viaRpc.error) {
         if (viaRpc.data === false) return setMessage("registerMessage", "Username sudah terdaftar.", true);
@@ -1036,7 +1099,7 @@ function renderAuth() {
       }
       if (!rpcMissing(viaRpc.error)) return setMessage("registerMessage", "Gagal buat akun: " + rpcErrorMessage(viaRpc.error), true);
 
-      // Jalur lama (SQL auth belum dijalankan)
+      // 3. Jalur lama (SQL auth belum dijalankan)
       const { data: existingUser, error: checkError } = await supabase.from('users_custom').select('username, role').eq('username', username).maybeSingle();
       if (checkError) return setMessage("registerMessage", "Error cek DB: " + checkError.message, true);
       if (existingUser) return setMessage("registerMessage", "Username sudah terdaftar.", true);
@@ -1064,7 +1127,17 @@ function renderAuth() {
     const passwordHash = await hashPassword(password);
 
     if (supabase) {
-      // Server yang membandingkan hash, jadi kolom password_hash tidak perlu dibaca klien.
+      // 1. Endpoint Function: dibatasi per IP + global, dan server yang membandingkan hash.
+      const endpoint = await postJson("/api/login", { username, password });
+      if (endpoint && endpoint.ok && endpoint.data && endpoint.data.username) {
+        saveSession({ username: endpoint.data.username, role: endpoint.data.role || "user" }, passwordHash);
+        location.href = "index.html";
+        return;
+      }
+      if (endpoint && endpoint.status === 401) return setMessage("loginMessage", "Username atau sandi salah.", true);
+      if (endpoint && endpoint.status === 429) return setMessage("loginMessage", throttleMessage(endpoint.data), true);
+
+      // 2. RPC langsung (endpoint belum ada di deploy lama)
       const viaRpc = await supabase.rpc("verify_login", { p_username: username, p_password: password });
       if (!viaRpc.error) {
         const row = Array.isArray(viaRpc.data) ? viaRpc.data[0] : viaRpc.data;
@@ -1075,7 +1148,7 @@ function renderAuth() {
       }
       if (!rpcMissing(viaRpc.error)) return setMessage("loginMessage", "Error DB: " + rpcErrorMessage(viaRpc.error), true);
 
-      // Jalur lama (SQL auth belum dijalankan)
+      // 3. Jalur lama (SQL auth belum dijalankan)
       const { data: user, error } = await supabase.from('users_custom')
         .select('username, role')
         .eq('username', username)

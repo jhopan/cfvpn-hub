@@ -1,0 +1,68 @@
+# CI cfvpn-hub: pemeriksaan deterministik tanpa jaringan dan tanpa Cloudflare.
+#
+# Kenapa harness smoke (tests/smoke-vpn-worker.mjs) TIDAK dijalankan di CI:
+# smoke itu menjalankan wrangler pages dev, menunggu port lokal, dan memanggil
+# layanan eksternal (Cloudflare/Supabase). Runner GitHub tidak punya kredensial,
+# binding, maupun endpoint tersebut, jadi hasilnya rapuh dan bukan bukti kode rusak.
+# Smoke tetap dijalankan manual di mesin dev. CI di sini hanya memverifikasi hal
+# yang tidak butuh jaringan: unit test, sinkronisasi template worker, dan sintaks
+# semua berkas yang dikirim atau dijalankan runtime.
+#
+# Catatan: "npm ci" sengaja tidak dipakai. Uji hanya memakai API bawaan Node
+# (node --test) dan node --check, jadi tidak ada dependensi yang perlu dipasang.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Uji & cek sintaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Node 22 wajib: repo memakai global WebSocket (fetch/worker proxy),
+      # yang belum tersedia di Node 18/20.
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Unit test
+        run: npm test
+
+      - name: Cek sinkronisasi template worker
+        run: npm run check:templates
+
+      - name: Cek sintaks berkas kirim
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for path in frontend/app.js frontend/sw.js frontend/source/*.js functions/api/*.js cron-worker/src/*.js; do
+            if [ ! -f "$path" ]; then
+              echo "GAGAL: berkas tidak ditemukan: $path"
+              status=1
+              continue
+            fi
+            if node --check "$path"; then
+              echo "OK   $path"
+            else
+              echo "GAGAL: sintaks error di $path"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "Ada berkas dengan sintaks error."
+            exit 1
+          fi
+          echo "Semua berkas lolos node --check."

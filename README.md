@@ -200,6 +200,14 @@ dan halaman Generator menandai baris terverifikasi dengan ✓.
    login sebelum SQL dijalankan karena jalur lama dipakai otomatis. **Status: kedua berkas SQL
    sudah dijalankan di proyek ini (2026-11-14); akun lama perlu login ulang sekali** supaya sesi
    membawa verifikasi untuk aksi admin.
+5. `POST /api/login` dan `POST /api/register` (Pages Functions) membatasi percobaan per IP, lalu
+   menaikkannya jadi batas **global** lewat `sql/2026-11-14-ratelimit.sql`. Panel otomatis memakai
+   jalur lama kalau endpoint atau fungsinya belum ada.
+6. State per user (`user_states`) hanya bisa dibaca/ditulis pemiliknya lewat RPC
+   (`sql/2026-11-14-state-hardening.sql`), jadi sesi palsu di browser tidak bisa menimpa daftar
+   worker orang lain. Batas 256 KB per user.
+7. CI: `.github/workflows/ci.yml` menjalankan `npm test`, `npm run check:templates`, dan
+   `node --check` untuk semua berkas yang dikirim (harness smoke tidak, karena butuh jaringan).
 2. `POST /api/cf` punya rate limit per IP (bawaan 10 permintaan / 600 detik). Atur lewat env
    `RATE_LIMIT` dan `RATE_WINDOW_SEC`. Batas ini per-colo dan best-effort, bukan kuota global.
 3. Gerbang Origin opsional: isi env `ALLOWED_ORIGINS` (mis. `https://cfvpn-hub-9xy.pages.dev`,
