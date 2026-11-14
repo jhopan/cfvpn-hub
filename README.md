@@ -164,7 +164,7 @@ export CLOUDFLARE_ACCOUNT_ID="your_account_id"
 npm run deploy
 ```
 
-Atau hubungkan GitHub repo ke Cloudflare Pages untuk auto-deploy.
+Integrasi Git Cloudflare Pages **belum** aktif di project ini: push ke `main` tidak memicu build. Kalau ingin auto-deploy, hubungkan repo lewat dashboard Pages — sebelum itu, deploy selalu lewat `npm run deploy`.
 
 ## Cron Worker (Proxy Checker)
 

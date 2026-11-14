@@ -6,14 +6,14 @@
 
 - Live: https://cfvpn-hub-9xy.pages.dev (Pages project `cfvpn-hub` di akun Adelia — target deploy saat ini)
 - Live lama: https://cfvpn-hub-dcx.pages.dev (akun Alan; tidak dipakai lagi)
-- Repo: https://github.com/jhopan/cfvpn-hub — branch `main`; push to `main` → Cloudflare Pages rebuild (build output dir = `frontend`).
+- Repo: https://github.com/jhopan/cfvpn-hub — branch `main`. **Push ke `main` TIDAK memicu deploy**: integrasi Git Cloudflare Pages tidak aktif untuk project ini (dibuktikan 15 Nov — commit `a8f6abb` tidak punya status deploy Cloudflare, hanya check-run CI `Uji & cek sintaks`). Deploy = `npm run deploy` (wrangler direct upload, output dir `frontend`); setelah deploy, verifikasi isi aset di `https://cfvpn-hub-9xy.pages.dev` (`app.js` memuat versi terbaru) karena service worker bisa menyajikan salinan lama.
 - No build step, no framework, no bundler. `frontend/` is uploaded verbatim.
 
 Three independently deployed units:
 
 | Unit | Config | Deploy |
 |---|---|---|
-| Pages project `cfvpn-hub` (frontend + `functions/api/cf.js`) | `wrangler.toml` | `npm run deploy` (akun Adelia — lihat “Deployment identity”) / GitHub auto-deploy |
+| Pages project `cfvpn-hub` (frontend + `functions/api/cf.js`) | `wrangler.toml` | `npm run deploy` (akun Adelia — lihat “Deployment identity”); satu-satunya jalur deploy |
 | Cron Worker `proxy-cron-worker` | `cron-worker/wrangler.toml` | manual `cd cron-worker && npx wrangler deploy` |
 | Per-user VPN Workers / Load Balancer | `frontend/source/*.js` templates | panel Deploy page, or `deploy-bulk.mjs` |
 
