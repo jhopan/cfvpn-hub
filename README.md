@@ -196,7 +196,9 @@ dimatikan, 7 baris aktif tapi terbukti mati.
 Worker memakai `tunnel_ok` sebagai urutan pertama saat memilih proxy dari pool,
 dan halaman Generator menandai baris terverifikasi dengan ✓.
 
-Scraper (`proxy-scraper/`) melakukan verifikasi **dua tingkat**: handshake + `GET 204` di port 80,
+Pipeline produksi untuk mengisi pool adalah **panproxyscanner** (jalan terjadwal di server, siklus 120 menit, verifikasi HTTP → TLS 443 → port non-standar). Panel dan worker menganggap `tls_ok = true` sebagai bukti setara `tunnel_ok`.
+
+Scraper lokal (`proxy-scraper/`) melakukan verifikasi **dua tingkat**: handshake + `GET 204` di port 80,
 lalu **TLS 443 lewat tunnel** (`tls-trace.mjs`) sekaligus mengambil **negara keluar** dari
 `cdn-cgi/trace`. Hanya baris yang lulus TLS yang dipromosikan, jadi proxy yang memblokir atau
 mengacak TLS tidak lagi masuk pool. Jalankan berkala (mis.

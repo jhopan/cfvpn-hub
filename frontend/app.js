@@ -525,7 +525,7 @@ async function loadProxyPickerData() {
     // Kolom tunnel bisa belum ada (butuh SQL), jadi kalau PostgREST menolaknya panel tetap jalan
     // dengan proyeksi lama.
     const base = "ip,port,country,org,last_checked,ping";
-    const { data, error } = await supabase.from("proxy_pool").select(base + ",tunnel_ok,tunnel_ms").eq("is_active", true);
+    const { data, error } = await supabase.from("proxy_pool").select(base + ",tunnel_ok,tunnel_ms,tls_ok").eq("is_active", true);
     let rows = data;
     if (error) ({
       data: rows,
@@ -540,6 +540,9 @@ async function loadProxyPickerData() {
         ping: Number(p.ping) || 0,
         tunnel: typeof p.tunnel_ok === "boolean" ? p.tunnel_ok : null,
         tunnelMs: Number(p.tunnel_ms) || 0,
+        // tls_ok diisi panproxyscanner: bukti tunnel TLS 443 dengan verifikasi sertifikat.
+        // Hanya nilai true yang jadi bukti; false berarti belum diperiksa versi itu.
+        tls: p.tls_ok === true,
       }));
     }
   }
@@ -562,7 +565,9 @@ function proxyHealth(list, countries) {
     const t = Date.parse(p.checked || "");
     return Number.isFinite(t) && (now - t) < PROXY_FRESH_MS;
   });
-  const verifiedList = fresh.filter((p) => p.tunnel === true);
+  // Bukti dari dua sumber: probe tunnel cron (edge) atau verifikasi TLS panproxyscanner.
+  const proven = (p) => p.tunnel === true || p.tls === true;
+  const verifiedList = fresh.filter(proven);
   const usable = fresh.filter((p) => p.tunnel !== false);
   return {
     total: scope.length,

@@ -71,14 +71,17 @@ const poolFetching = new Map();
 // hanya dipakai untuk mengurutkan.
 // Tercepat dulu: baris terverifikasi tunnel di atas, lalu menurut waktu tunnel nyata
 // (tunnel_ms), baru ping cek ringan. Dengan urutan ini pilihan pertama selalu yang tercepat.
-const POOL_ORDER_TUNNEL_OK = "tunnel_ok.desc.nullslast,tunnel_ms.asc.nullslast,ping.asc.nullslast";
-const POOL_ORDER_PING = "ping.asc.nullslast";
-// Kolom tunnel_ok ditambahkan manual ke tabel proxy_pool; selama belum ada, PostgREST
-// menolak urutan yang menyebutnya (400). Sekali ketahuan tidak ada, jangan bayar dua
-// request di setiap koneksi: ingat sebentar per isolate (SQL-nya bisa dijalankan kapan saja).
+// Urutan pool dicoba berurutan sampai ada yang diterima PostgREST, karena kolom bukti
+// ditambahkan manual ke tabel: worker harus tahan pada skema yang belum lengkap.
+// `tls_ok` diisi panproxyscanner = bukti tunnel TLS 443 dengan verifikasi sertifikat.
+const POOL_ORDERS = [
+  "tunnel_ok.desc.nullslast,tls_ok.desc.nullslast,tunnel_ms.asc.nullslast,ping.asc.nullslast",
+  "tunnel_ok.desc.nullslast,tunnel_ms.asc.nullslast,ping.asc.nullslast",
+  "ping.asc.nullslast",
+];
 const POOL_ORDER_MEMO_MS = 300000;
-let tunnelOkColumn = null; // null = belum diketahui, true = ada, false = tidak ada
-let tunnelOkColumnAt = 0;
+let poolOrderIndex = 0; // urutan terdalam yang terakhir diterima
+let poolOrderAt = 0;
 let fallbackUses = 0;
 
 // Watchdog: kalau klien sudah mengirim data tapi target tidak membalas apa pun selama
@@ -1089,11 +1092,6 @@ async function poolFallbacks(env) {
 }
 
 // Coba urutan tunnel_ok kecuali kolomnya sudah terbukti (masih dalam masa ingat) tidak ada.
-function preferTunnelOkOrder() {
-  if (tunnelOkColumn === true) return true;
-  if (tunnelOkColumn === false && Date.now() - tunnelOkColumnAt < POOL_ORDER_MEMO_MS) return false;
-  return true; // belum diketahui / ingatan kedaluwarsa: kolomnya mungkin sudah dibuat
-}
 
 async function fetchPoolProxies(env, countries) {
   try {
@@ -1109,23 +1107,21 @@ async function fetchPoolProxies(env, countries) {
       }), FALLBACK_FETCH_TIMEOUT);
     };
 
-    const tryTunnelOk = preferTunnelOkOrder();
-    let res = await get(tryTunnelOk ? POOL_ORDER_TUNNEL_OK : POOL_ORDER_PING);
-    let orderRejected = false;
-    if (!res.ok && tryTunnelOk) {
-      // Urutan ditolak (kolom tunnel_ok belum ada): ulangi SEKALI dengan query lama. Urutan
-      // tidak boleh menggagalkan pengambilan pool, jadi penolakan ini tetap diingat supaya
-      // koneksi berikutnya tidak mengulang dua request.
-      orderRejected = true;
-      tunnelOkColumn = false;
-      tunnelOkColumnAt = Date.now();
+    // Mulai dari urutan terdalam yang terakhir diterima. Kalau ingatan sudah lama, coba lagi
+    // dari atas: skema bisa saja sudah dilengkapi (kolom baru ditambahkan manual).
+    let start = poolOrderAt && Date.now() - poolOrderAt <= POOL_ORDER_MEMO_MS ? poolOrderIndex : 0;
+    let res = null;
+    let used = start;
+    for (let i = start; i < POOL_ORDERS.length; i++) {
+      res = await get(POOL_ORDERS[i]);
+      if (res.ok) { used = i; break; }
       logLimited("poolOrder", "HTTP " + res.status);
-      res = await get(POOL_ORDER_PING);
     }
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    if (tryTunnelOk && !orderRejected) {
-      tunnelOkColumn = true;
-      tunnelOkColumnAt = Date.now();
+    if (!res || !res.ok) throw new Error("HTTP " + (res ? res.status : "?"));
+    if (used !== poolOrderIndex || !poolOrderAt) {
+      if (used > start) counters.poolOrder = (counters.poolOrder || 0) + 1;
+      poolOrderIndex = used;
+      poolOrderAt = Date.now();
     }
     const rows = await res.json();
     return rows
