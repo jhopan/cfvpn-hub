@@ -974,6 +974,15 @@ function rpcErrorMessage(error) {
   return String((error && error.message) || "tidak diketahui");
 }
 // Sesi menyimpan hash sandi (bukan sandinya) karena aksi admin diverifikasi server dengan hash itu.
+// Aksi admin diverifikasi server dengan hash sandi pelaku. Sesi lama (login sebelum SQL auth,
+// atau sebelum login ulang) tidak membawa hash itu, jadi beri pesan yang jelas daripada error RPC
+// mentah "Hanya admin yang boleh melakukan ini".
+function adminActor() {
+  if (!supabase) throw new Error("Supabase tidak terkoneksi.");
+  if (!currentUser || !currentUser.hash) throw new Error("Sesi ini belum membawa verifikasi sandi — login ulang dulu.");
+  return { p_actor: currentUser.username, p_actor_hash: currentUser.hash };
+}
+
 function saveSession(user, hash) {
   const session = { username: user.username, role: user.role || "user" };
   if (hash) session.hash = hash;
@@ -1151,7 +1160,7 @@ function renderAdmin() {
       toggleBtn.disabled = true;
       try {
         const viaRpc = await supabase.rpc("admin_action", {
-          p_actor: currentUser?.username || "", p_actor_hash: currentUser?.hash || "",
+          ...adminActor(),
           p_action: "set_role", p_target: username, p_role: newRole,
         });
         if (viaRpc.error) {
@@ -1175,7 +1184,7 @@ function renderAdmin() {
       delBtn.disabled = true;
       try {
         const viaRpc = await supabase.rpc("admin_action", {
-          p_actor: currentUser?.username || "", p_actor_hash: currentUser?.hash || "",
+          ...adminActor(),
           p_action: "delete", p_target: username,
         });
         if (viaRpc.error) {
@@ -1205,7 +1214,7 @@ function renderAdmin() {
     btn.textContent = "Menyimpan...";
     try {
       const viaRpc = await supabase.rpc("admin_action", {
-        p_actor: currentUser?.username || "", p_actor_hash: currentUser?.hash || "",
+        ...adminActor(),
         p_action: "create", p_target: username, p_role: "admin", p_password: password,
       });
       if (!viaRpc.error && viaRpc.data === false) { setMessage("addAdminMessage", "Username sudah ada.", true); return; }

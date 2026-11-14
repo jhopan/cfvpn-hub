@@ -197,7 +197,9 @@ dan halaman Generator menandai baris terverifikasi dengan ✓.
 1. **Deploy panel dulu**, baru jalankan `sql/2026-11-14-auth-hardening.sql` di Supabase SQL Editor.
    Setelah itu kolom hash sandi tidak bisa dibaca dengan anon key dan pembuatan/pengubahan admin
    diverifikasi server (RPC `verify_login`, `register_user`, `admin_action`). Panel tetap bisa
-   login sebelum SQL dijalankan karena jalur lama dipakai otomatis.
+   login sebelum SQL dijalankan karena jalur lama dipakai otomatis. **Status: kedua berkas SQL
+   sudah dijalankan di proyek ini (2026-11-14); akun lama perlu login ulang sekali** supaya sesi
+   membawa verifikasi untuk aksi admin.
 2. `POST /api/cf` punya rate limit per IP (bawaan 10 permintaan / 600 detik). Atur lewat env
    `RATE_LIMIT` dan `RATE_WINDOW_SEC`. Batas ini per-colo dan best-effort, bukan kuota global.
 3. Gerbang Origin opsional: isi env `ALLOWED_ORIGINS` (mis. `https://cfvpn-hub-9xy.pages.dev`,

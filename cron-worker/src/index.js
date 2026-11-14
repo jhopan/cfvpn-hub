@@ -260,6 +260,13 @@ export default {
       lastRun.error = errorText(err);
       console.error("Cron crash:", err);
     } finally {
+      // Field ringkas di atas disalin dari stats supaya /status tidak menampilkan 0 padahal
+      // pekerjaan berjalan (dulu membingungkan saat mendiagnosa siklus yang macet).
+      if (lastRun.stats) {
+        lastRun.checked = lastRun.stats.checked;
+        lastRun.tunnel = lastRun.stats.tunnel;
+        lastRun.disabled = lastRun.stats.disabled;
+      }
       lastRun.finishedAt = new Date().toISOString();
     }
   }
