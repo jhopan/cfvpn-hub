@@ -245,7 +245,7 @@ Project lama `cgflrpjavyotvolnvcnl` (anon-key-only, bukan milik akun ini) tidak 
 Kolom tunnel (cron) dan auth hardening sudah dijalankan. Tersisa (urutan penting): deploy panel
 dulu (termasuk `/api/pool-purge`), pasang secret `SUPABASE_SERVICE_KEY`, baru
 `sql/2026-11-15-pool-prune-service-key.sql` — kalau DELETE anon dicabut sebelum function-nya
-ter-deploy, tombol "bersihkan baris mati" gagal sampai deploy berikutnya. **Urutan:** deploy panel dulu, baru auth hardening; kolom tunnel boleh kapan saja karena kode tahan kolom hilang. Sebelum SQL auth dijalankan, `users_custom` masih bisa dibaca anon (termasuk `password_hash`) — anggap semua yang terekspos lewat anon key itu publik sampai SQL dijalankan.
+ter-deploy, tombol "bersihkan baris mati" gagal sampai deploy berikutnya. **Setiap berkas migrasi WAJIB diuji di Postgres lokal sebelum dijalankan** (kelas kesalahan yang sudah tertangkap: `drop policy if exists <nama> on <tabel> for insert ...` bukan sintaks sah — hanya `drop policy if exists <nama> on <tabel>`; dan blok policy di berkas kolom pernah mencabut izin tulis anon tanpa pernah membuat ulang). **Urutan:** deploy panel dulu, baru auth hardening; kolom tunnel boleh kapan saja karena kode tahan kolom hilang. Sebelum SQL auth dijalankan, `users_custom` masih bisa dibaca anon (termasuk `password_hash`) — anggap semua yang terekspos lewat anon key itu publik sampai SQL dijalankan.
 
 ## Hard Rules (non-negotiable)
 

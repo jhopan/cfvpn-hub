@@ -36,19 +36,9 @@ comment on column public.proxy_pool.tunnel_host_checked is 'Waktu probe tunnel h
 create index if not exists proxy_pool_active_tunnel_host_idx
   on public.proxy_pool (is_active, tunnel_host_checked asc nulls first);
 
--- Policy bersifat per-baris (bukan per-kolom), jadi sebenarnya sudah mencakup kolom baru; blok ini
--- diulang supaya anon yang dipakai Pan-ProxyScanner (anon key, bukan service key) tetap bisa
--- menulis kolom ini walau urutan migrasi berbeda. Aman diulang.
-alter table if exists public.proxy_pool enable row level security;
-
-drop policy if exists proxy_pool_select_anon on public.proxy_pool;
-create policy proxy_pool_select_anon on public.proxy_pool for select to anon, authenticated using (true);
-
-drop policy if exists proxy_pool_insert_anon on public.proxy_pool for insert to anon, authenticated with check (true);
-
-drop policy if exists proxy_pool_update_anon on public.proxy_pool for update to anon, authenticated using (true) with check (true);
-
-drop policy if exists proxy_pool_delete_anon on public.proxy_pool for delete to anon, authenticated using (true);
-
+-- Policy TIDAK diurus berkas ini. Izin anon (select/insert/update) dan pencabutan DELETE
+-- dimiliki oleh sql/2026-11-15-pool-prune-service-key.sql; berkas ini pernah memuat blok policy
+-- yang salah bentuk (drop policy ... for insert) sehingga seolah-olah mengatur izin, padahal tidak
+-- pernah membuatnya. Jangan menambahkan DROP/CREATE POLICY di sini lagi.
 -- PostgREST menyimpan skema di cache; tanpa ini kolom baru masih terlihat tidak ada.
 notify pgrst, 'reload schema';
