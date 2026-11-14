@@ -36,7 +36,18 @@ create table if not exists public.proxy_pool (
   ping         integer,
   tls_ok       boolean not null default false,
   alt_ok       boolean not null default false,
-  exit_ip      text
+  exit_ip      text,
+  -- Kolom tunnel. `tunnel_*` = verdict probe tunnel dari EDGE Cloudflare (cron-worker CFVPN,
+  -- vantage tempat worker VLESS berjalan); `tunnel_host_*` = bukti dari MESIN panproxyscanner
+  -- (vantage host). `null` = belum pernah diprobe, berbeda dari `false` = terbukti gagal.
+  -- Untuk project yang sudah berjalan, kolom ini ditambahkan lewat berkas di sql/
+  -- (2026-11-14-proxy-tunnel-columns.sql dan 2026-11-14-tunnel-host-columns.sql).
+  tunnel_ok           boolean,
+  tunnel_ms           integer,
+  tunnel_checked      timestamptz,
+  tunnel_host_ok      boolean,
+  tunnel_host_ms      integer,
+  tunnel_host_checked timestamptz
 );
 
 -- pasangan (ip, port) unik: push dari proxy-scraping memakai upsert on_conflict=ip,port

@@ -176,18 +176,67 @@ function formatConfigs(configs, format) {
 }
 
 
-function pageName() { return location.pathname.split("/").pop() || "index.html"; }
+// Cloudflare Pages menyajikan /admin.html sebagai /admin (308) dan /index.html sebagai /, jadi
+// nama halaman dinormalkan ke bentuk "*.html" lebih dulu — tanpa itu gerbang di checkAuth
+// (protectedPages, halaman admin) tidak pernah cocok dengan URL yang benar-benar dibuka pengunjung.
+function pageName() {
+  const name = location.pathname.split("/").pop() || "";
+  if (!name) return "index.html";
+  return name.includes(".") ? name : name + ".html";
+}
 
 let state = { ...emptyState };
 let currentUser = null; // now holds { username: string }
+
+// Sesi di localStorage hanya bisa dipercaya kalau server membenarkan `hash`-nya. Sebelum ini
+// setiap halaman selain users_custom cuma digerbangi session di localStorage, jadi siapa pun bisa
+// membuka halaman admin dengan menulis `role: "admin"` sendiri di console (aksi admin sendiri tetap
+// butuh hash yang diverifikasi admin_action). whoami (sql/2026-11-14-whoami.sql) memindahkan
+// pemeriksaan itu ke server dan mengembalikan role yang sebenarnya.
+//
+// Hasil: "ok" (role di currentUser sudah dari server), "invalid" (hash tidak cocok => sesi palsu
+// atau basi), "skipped" (RPC belum ada, atau sesi tidak membawa hash => perilaku lama apa adanya).
+async function verifySession() {
+  if (!currentUser || !supabase) return "skipped";
+  const username = typeof currentUser.username === "string" ? currentUser.username : "";
+  const hash = typeof currentUser.hash === "string" ? currentUser.hash : "";
+  if (!username || !hash) return "skipped";
+
+  const viaRpc = await supabase.rpc("whoami", { p_username: username, p_hash: hash });
+  if (viaRpc.error) {
+    if (rpcMissing(viaRpc.error)) return "skipped";
+    // RPC ada tapi gagal (jaringan/DB): jangan mengunci orang karena gangguan sesaat.
+    console.warn("whoami gagal:", rpcErrorMessage(viaRpc.error));
+    return "skipped";
+  }
+
+  // NULL/kosong = tidak ada baris yang cocok. Role yang dipakai UI selalu dari sini.
+  const role = typeof viaRpc.data === "string" ? viaRpc.data.trim() : "";
+  if (!role) return "invalid";
+  currentUser = { ...currentUser, role: role };
+  return "ok";
+}
 
 async function checkAuth() {
   const s = localStorage.getItem(sessionKey);
   currentUser = s ? JSON.parse(s) : null;
 
-  const isProtected = protectedPages.has(pageName());
-  const isAuthPage = pageName() === "login.html" || pageName() === "register.html";
-  
+  const page = pageName();
+  const isProtected = protectedPages.has(page);
+  const isAuthPage = page === "login.html" || page === "register.html";
+
+  const verdict = await verifySession();
+  if (verdict === "invalid") {
+    localStorage.removeItem(sessionKey);
+    currentUser = null;
+    // Di halaman login/daftar sudah berada di tempat yang benar (dan halaman itu tidak direload
+    // supaya isian form tidak hilang); di halaman lain sesi palsu dilempar ke login.
+    if (!isAuthPage) {
+      location.replace("login.html");
+      return false;
+    }
+  }
+
   if (isProtected && !currentUser) {
     location.replace("landing.html");
     return false;
@@ -196,8 +245,8 @@ async function checkAuth() {
     location.replace("index.html");
     return false;
   }
-  // Admin page: only admin role
-  if (pageName() === "admin.html" && currentUser?.role !== "admin") {
+  // Admin page: only admin role — dari hasil whoami, bukan `role` di localStorage.
+  if (page === "admin.html" && currentUser?.role !== "admin") {
     location.replace("index.html");
     return false;
   }
@@ -372,7 +421,7 @@ function renderDashboard() {
 // Versi template worker yang terpasang di frontend ini. Harus sama dengan WORKER_VERSION di
 // frontend/source/vpn-worker-*.js: /health mengembalikannya, jadi panel bisa menandai worker
 // yang masih versi lama dan menawarkan deploy ulang.
-const WORKER_TEMPLATE_VERSION = "2026-11-13b";
+const WORKER_TEMPLATE_VERSION = "2026-11-14a";
 
 // Cek versi tiap worker aktif lewat /health (CORS terbuka) dan tampilkan badge.
 async function checkWorkerVersions(workers) {
@@ -513,7 +562,7 @@ async function loadProxyPickerData() {
   const CACHE_TTL = 6 * 60 * 60 * 1000;
   try {
     const cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
-    if (cached && cached.v === 2 && (Date.now() - cached.ts) < CACHE_TTL) {
+    if (cached && cached.v === 3 && (Date.now() - cached.ts) < CACHE_TTL) {
       _proxyPickerCache = cached.data;
       return _proxyPickerCache;
     }
@@ -521,15 +570,21 @@ async function loadProxyPickerData() {
   let proxies = [];
   if (supabase) {
     // `last_checked` dipakai untuk tahu baris mana yang masih segar (worker hanya memakai baris
-    // < 6 jam), sedangkan `tunnel_ok`/`tunnel_ms` diisi cron-worker dari probe tunnel nyata.
-    // Kolom tunnel bisa belum ada (butuh SQL), jadi kalau PostgREST menolaknya panel tetap jalan
-    // dengan proyeksi lama.
+    // < 6 jam). `tunnel_ok`/`tunnel_ms` diisi cron-worker dari probe tunnel di edge, sedangkan
+    // `tunnel_host_ok`/`tunnel_host_ms` diisi panproxyscanner dari mesin scanner (vantage host).
+    // Kolom bukti ditambahkan manual ke tabel, jadi proyeksi dicoba dari yang terlengkap ke yang
+    // paling lama: PostgREST menolak kolom yang belum ada dan panel tetap jalan seperti dulu.
     const base = "ip,port,country,org,last_checked,ping";
-    const { data, error } = await supabase.from("proxy_pool").select(base + ",tunnel_ok,tunnel_ms,tls_ok").eq("is_active", true);
-    let rows = data;
-    if (error) ({
-      data: rows,
-    } = await supabase.from("proxy_pool").select(base).eq("is_active", true));
+    const projections = [
+      base + ",tunnel_ok,tunnel_ms,tls_ok,tunnel_host_ok,tunnel_host_ms",
+      base + ",tunnel_ok,tunnel_ms,tls_ok",
+      base,
+    ];
+    let rows = null;
+    for (const projection of projections) {
+      const res = await supabase.from("proxy_pool").select(projection).eq("is_active", true);
+      if (!res.error) { rows = res.data; break; }
+    }
     if (rows && rows.length) {
       proxies = rows.map((p) => ({
         ip: p.ip,
@@ -540,8 +595,10 @@ async function loadProxyPickerData() {
         ping: Number(p.ping) || 0,
         tunnel: typeof p.tunnel_ok === "boolean" ? p.tunnel_ok : null,
         tunnelMs: Number(p.tunnel_ms) || 0,
-        // tls_ok diisi panproxyscanner: bukti tunnel TLS 443 dengan verifikasi sertifikat.
-        // Hanya nilai true yang jadi bukti; false berarti belum diperiksa versi itu.
+        // Bukti dari vantage host (mesin scanner). `tls_ok` (kolom lama) dan `tunnel_host_ok`
+        // (kolom baru) sama-sama tulisan panproxyscanner; hanya nilai true yang jadi bukti.
+        hostTunnel: p.tunnel_host_ok === true,
+        hostTunnelMs: Number(p.tunnel_host_ms) || 0,
         tls: p.tls_ok === true,
       }));
     }
@@ -550,9 +607,20 @@ async function loadProxyPickerData() {
   if (!proxies.length) return [];
   proxies = proxies.map(p => ({ ...p, country: p.country || "??", org: p.org || "Unknown" }));
   _proxyPickerCache = proxies;
-  localStorage.setItem(CACHE_KEY, JSON.stringify({ v: 2, data: proxies, ts: Date.now() }));
+  localStorage.setItem(CACHE_KEY, JSON.stringify({ v: 3, data: proxies, ts: Date.now() }));
   return proxies;
 }
+
+// Bukti satu baris: `edge` = probe tunnel cron-worker CFVPN (vantage edge, kolom `tunnel_ok`),
+// `host` = verifikasi dari mesin scanner (kolom baru `tunnel_host_ok`, atau `tls_ok` versi lama).
+// Baris yang di edge terbukti mati (`tunnel === false`) bukan bukti apa pun walau host bilang
+// hidup: worker VLESS berjalan di edge, jadi vonis edge yang menentukan.
+function proxyEvidence(p) {
+  if (p.tunnel === true) return { kind: "edge", ms: Number(p.tunnelMs) || 0 };
+  if (p.hostTunnel === true || p.tls === true) return { kind: "host", ms: Number(p.hostTunnelMs) || 0 };
+  return { kind: "", ms: 0 };
+}
+function evidenceLabel(ev) { return ev.kind ? `✓ ${ev.kind}${ev.ms ? " " + ev.ms + " ms" : ""}` : ""; }
 
 // Sehat = cron baru mengecek (< 6 jam, sama seperti filter pool di worker) dan tidak pernah
 // dinyatakan mati oleh probe tunnel. `null` berarti belum pernah diprobe, bukan mati.
@@ -565,20 +633,29 @@ function proxyHealth(list, countries) {
     const t = Date.parse(p.checked || "");
     return Number.isFinite(t) && (now - t) < PROXY_FRESH_MS;
   });
-  // Bukti dari dua sumber: probe tunnel cron (edge) atau verifikasi TLS panproxyscanner.
-  const proven = (p) => p.tunnel === true || p.tls === true;
-  const verifiedList = fresh.filter(proven);
+  // Baris yang di edge terbukti mati tidak pernah masuk daftar bukti maupun pilihan (selalu
+  // kalah): mayoritas pool masih `tls_ok = true`, jadi `tls_ok`/`tunnel_host_ok` sendirian tidak
+  // boleh membuat baris mati ikut ditawarkan.
   const usable = fresh.filter((p) => p.tunnel !== false);
+  // Tingkat bukti dari kuat ke lemah, saling lepas supaya hitungannya tidak dobel:
+  // edge (tunnel nyata dari edge) → host (tunnel nyata dari mesin scanner) → segar tanpa bukti.
+  const edge = usable.filter((p) => p.tunnel === true);
+  const host = usable.filter((p) => p.tunnel !== true && (p.hostTunnel === true || p.tls === true));
+  const unproven = usable.filter((p) => p.tunnel !== true && !(p.hostTunnel === true || p.tls === true));
+  const verifiedList = edge.concat(host);
   return {
     total: scope.length,
     fresh: fresh.length,
+    edgeCount: edge.length,
+    hostCount: host.length,
+    unprovenCount: unproven.length,
     verifiedCount: verifiedList.length,
     knownDead: fresh.filter((p) => p.tunnel === false).length,
     usable: usable.slice().sort(proxySpeed),
     verified: verifiedList.slice().sort(proxySpeed),
-    // Kalau sudah ada cukup baris yang terbukti tembus tunnel, tawarkan hanya itu: baris yang
-    // belum pernah diprobe masih untung-untungan, dan cron hampir selalu mematikan separuhnya.
-    preferred: (verifiedList.length >= 2 ? verifiedList.slice() : usable.slice()).sort(proxySpeed),
+    // Tawarkan tingkat bukti terbaik yang tersedia saja: edge dulu, lalu host, dan hanya kalau
+    // belum ada bukti apa pun barulah baris segar yang belum diprobe (masih untung-untungan).
+    preferred: (edge.length ? edge : host.length ? host : unproven).slice().sort(proxySpeed),
   };
 }
 
@@ -616,13 +693,24 @@ function renderGenerator() {
       return `<option value="${c}">${getFlagEmoji(c)} ${c} · ${fresh} segar</option>`;
     }).join("");
   };
+  // Rincian asal bukti untuk ringkasan: edge (probe tunnel cron-worker CFVPN) vs host (verifikasi
+  // panproxyscanner dari mesin scanner). Tingkatnya saling lepas, jadi edge + host = terverifikasi.
+  const evidenceBreakdown = (h) => {
+    const parts = [];
+    if (h.edgeCount) parts.push(`${h.edgeCount} terbukti edge`);
+    if (h.hostCount) parts.push(`${h.hostCount} terbukti host`);
+    if (h.unprovenCount) parts.push(`${h.unprovenCount} belum diprobe`);
+    return parts;
+  };
   const updateCountryStats = () => {
     const el = $("countryStats");
     if (!el) return;
     const cc = selectedCountries();
     if (!cc.length) {
       const all = proxyHealth(allProxies, []);
-      el.textContent = `${all.fresh} proxy segar di semua negara (${all.usable.length} siap dipakai).`;
+      const sources = evidenceBreakdown(all);
+      el.textContent = `${all.fresh} proxy segar di semua negara (${all.usable.length} siap dipakai).`
+        + (sources.length ? " " + sources.join(" · ") + "." : "");
       el.classList.remove("error");
       return;
     }
@@ -632,9 +720,14 @@ function renderGenerator() {
     if (h.verifiedCount) parts.push(h.verifiedCount + " terverifikasi tunnel");
     else if (h.knownDead) parts.push(`${h.knownDead} terbukti mati`);
     else parts.push("belum ada yang terverifikasi tunnel");
+    // Bagian baru (kalimat lama di atas tidak diubah): dari vantage mana buktinya, dan berapa yang
+    // justru dinyatakan mati oleh edge walau host masih bilang hidup.
+    const sources = evidenceBreakdown(h);
+    if (sources.length) parts.push(sources.join(" · "));
+    if (h.knownDead && h.verifiedCount) parts.push(`${h.knownDead} terbukti mati di edge`);
     let text = parts.join(" · ");
     if (!h.usable.length) text += " — kemungkinan gagal: tidak ada proxy siap pakai, pakai /ALL atau negara lain.";
-    if (h.verified.length) text += " · tercepat " + h.verified[0].tunnelMs + " ms";
+    if (h.verified.length) text += " · tercepat " + (proxyEvidence(h.verified[0]).ms || h.verified[0].ping) + " ms";
     el.textContent = text;
     el.classList.toggle("error", h.usable.length === 0);
   };
@@ -650,7 +743,10 @@ function renderGenerator() {
     const usable = proxyHealth(allProxies, cc).preferred;
     const filtered = org ? usable.filter(p => p.org === org) : usable;
     proxySelect.innerHTML = `<option value="">Acak (${filtered.length} proxy siap pakai)</option>` + filtered.slice(0, 200).map(p => {
-      return `<option value="${p.ip}:${p.port}">${getFlagEmoji(p.country)} ${p.ip}:${p.port} · ${escapeHtml(p.org)}${p.tunnel === true ? " ✓" : ""}</option>`;
+      // Tanda bukti menyebut sumbernya (edge/host) supaya kelihatan baris ini lolos dari vantage
+      // mana; baris tanpa bukti tidak diberi tanda.
+      const proof = evidenceLabel(proxyEvidence(p));
+      return `<option value="${p.ip}:${p.port}">${getFlagEmoji(p.country)} ${p.ip}:${p.port} · ${escapeHtml(p.org)}${proof ? " · " + proof : ""}</option>`;
     }).join("");
   };
 
@@ -1403,7 +1499,23 @@ function renderProxyManager() {
     empty.hidden = true;
     tbody.innerHTML = list.map(p => {
       const flag = p.country ? getFlagEmoji(p.country) : '🏳';
-      const status = p.is_active ? '<span class="proxy-status live">Aktif</span>' : '<span class="proxy-status dead">Mati</span>';
+      // Baris di sini datang sebagai baris mentah `proxy_pool` (proyeksi `*`), jadi kolomnya
+      // dibaca apa adanya: `tunnel_ok` = bukti edge, `tunnel_host_ok`/`tls_ok` = bukti host.
+      const ev = proxyEvidence({
+        tunnel: typeof p.tunnel_ok === 'boolean' ? p.tunnel_ok : null,
+        hostTunnel: p.tunnel_host_ok === true,
+        tls: p.tls_ok === true,
+        tunnelMs: p.tunnel_ms,
+        hostTunnelMs: p.tunnel_host_ms,
+      });
+      const proof = p.tunnel_ok === false
+        // Vonis edge yang menentukan (worker VLESS jalan di edge): baris begini tidak boleh
+        // tampak sehat walau host bilang tembus.
+        ? ` <span class="badge" title="probe tunnel dari edge terakhir gagal: proxy tidak meneruskan paket">✗ mati di edge</span>`
+        : ev.kind
+          ? ` <span class="badge" title="bukti ${ev.kind}${ev.ms ? ` ${ev.ms} ms` : ''}${p.tunnel_host_checked ? ` · host dicek ${fmtDate(p.tunnel_host_checked)}` : ''}">${evidenceLabel(ev)}</span>`
+          : '';
+      const status = p.is_active ? `<span class="proxy-status live">Aktif</span>${proof}` : '<span class="proxy-status dead">Mati</span>';
       return `<tr><td><code>${escapeHtml(p.ip)}:${escapeHtml(p.port)}</code></td><td>${flag} ${escapeHtml(p.country || '—')}</td><td>${escapeHtml(p.org || '—')}</td><td>${status}</td><td>${fmtDate(p.last_checked)}</td></tr>`;
     }).join('');
   };

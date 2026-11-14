@@ -66,17 +66,18 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const POOL_CACHE_MAX = 8;
 const poolCache = new Map();
 const poolFetching = new Map();
-// Urutan pool: proxy yang terbukti bisa dibuat tunnel dulu (tunnel_ok true -> null/belum
-// diprobe -> false), baru ping tercepat. Proyeksi `select` tidak ikut berubah — tunnel_ok
+// Urutan pool: bukti EDGE dulu, baru bukti host scanner, baru ping tercepat.
+// `tunnel_ok` diisi cron CFVPN dari edge = vantage yang sama dengan tempat worker ini jalan,
+// jadi verdictnya paling relevan (true -> null/belum diprobe -> false). `tls_ok` diisi
+// panproxyscanner dari host scanner = bukti tunnel TLS 443 + verifikasi sertifikat; ia hanya
+// penentu untuk baris yang belum pernah diprobe edge, karena host scanner bisa tembus ke
+// proxy yang dari edge sudah mati. Proyeksi `select` tidak ikut berubah — kedua kolom itu
 // hanya dipakai untuk mengurutkan.
-// Tercepat dulu: baris terverifikasi tunnel di atas, lalu menurut waktu tunnel nyata
-// (tunnel_ms), baru ping cek ringan. Dengan urutan ini pilihan pertama selalu yang tercepat.
 // Urutan pool dicoba berurutan sampai ada yang diterima PostgREST, karena kolom bukti
 // ditambahkan manual ke tabel: worker harus tahan pada skema yang belum lengkap.
-// `tls_ok` diisi panproxyscanner = bukti tunnel TLS 443 dengan verifikasi sertifikat.
 const POOL_ORDERS = [
-  "tunnel_ok.desc.nullslast,tls_ok.desc.nullslast,tunnel_ms.asc.nullslast,ping.asc.nullslast",
-  "tunnel_ok.desc.nullslast,tunnel_ms.asc.nullslast,ping.asc.nullslast",
+  "tunnel_ok.desc.nullslast,tls_ok.desc.nullslast,ping.asc.nullslast",
+  "tunnel_ok.desc.nullslast,ping.asc.nullslast",
   "ping.asc.nullslast",
 ];
 const POOL_ORDER_MEMO_MS = 300000;
@@ -98,7 +99,7 @@ const ROTATE_POOL_LIMIT = 6; // pilih acak dari N proxy teratas (sudah urut ping
 
 // Versi template: muncul di /health supaya panel bisa memastikan worker mana yang sudah
 // memakai kode terbaru.
-const WORKER_VERSION = "2026-11-13b";
+const WORKER_VERSION = "2026-11-14a";
 
 // Log dibatasi per jenis pesan: hitungan tetap akurat (muncul di /health) tetapi Workers Logs
 // tidak dibanjiri ketika pool proxy sedang banyak yang mati.
@@ -1035,11 +1036,11 @@ async function pickRotateProxy(env, countries) {
     if (unique.length >= ROTATE_POOL_LIMIT) break;
   }
   if (!unique.length) return null;
-  // Tercepat dulu: urutan kandidat datang dari server (tunnel_ok, lalu tunnel_ms, lalu ping),
-  // jadi kandidat pertama memang yang paling cepat. Konsekuensinya beban menumpuk di proxy
-  // teratas; itu diterima karena yang dicari adalah koneksi paling cepat, dan kalau proxy itu
-  // ternyata gagal, jalur cadangan (`fallbackCandidates`: hedge + FALLBACK_MAX) tetap mencoba
-  // kandidat berikutnya dari daftar yang sama.
+  // Tercepat dulu: urutan kandidat datang dari server (tunnel_ok edge, lalu tls_ok host
+  // scanner, lalu ping), jadi kandidat pertama memang yang paling layak. Konsekuensinya beban
+  // menumpuk di proxy teratas; itu diterima karena yang dicari adalah koneksi paling cepat, dan
+  // kalau proxy itu ternyata gagal, jalur cadangan (`fallbackCandidates`: hedge + FALLBACK_MAX)
+  // tetap mencoba kandidat berikutnya dari daftar yang sama.
   return unique[0];
 }
 
@@ -1091,7 +1092,7 @@ async function poolFallbacks(env) {
   return await poolProxies(env, []);
 }
 
-// Coba urutan tunnel_ok kecuali kolomnya sudah terbukti (masih dalam masa ingat) tidak ada.
+// Coba urutan bukti edge dulu, kecuali kolomnya sudah terbukti (masih dalam masa ingat) tidak ada.
 
 async function fetchPoolProxies(env, countries) {
   try {
@@ -1109,6 +1110,9 @@ async function fetchPoolProxies(env, countries) {
 
     // Mulai dari urutan terdalam yang terakhir diterima. Kalau ingatan sudah lama, coba lagi
     // dari atas: skema bisa saja sudah dilengkapi (kolom baru ditambahkan manual).
+    // `counters.poolOrder` naik sekali per urutan yang ditolak (gate log) + sekali saat akhirnya
+    // turun ke urutan yang lebih tua, jadi /health memperlihatkan berapa kali isolate ini
+    // membayar percobaan urutan.
     let start = poolOrderAt && Date.now() - poolOrderAt <= POOL_ORDER_MEMO_MS ? poolOrderIndex : 0;
     let res = null;
     let used = start;
