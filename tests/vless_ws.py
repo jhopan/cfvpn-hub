@@ -15,6 +15,12 @@ import time
 UUID_HEX = os.environ.get("VLESS_UUID", "14df7aee041645a8a651e69de188deca").replace("-", "").lower()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) vless-test/1.0"
 
+# Port dan TLS bisa ditimpa supaya config NTLS (port 80) juga bisa diuji:
+#   VLESS_PORT=80 VLESS_TLS=0 python tests/prod-proxy-check.py <host> <ip:port>
+# Berguna saat perangkat klien tidak bisa memvalidasi rantai sertifikat Cloudflare.
+PORT = int(os.environ.get("VLESS_PORT", "443"))
+USE_TLS = os.environ.get("VLESS_TLS", "1").lower() not in ("0", "false", "no")
+
 
 def dns_query(txid, name):
     labels = b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.split("."))
@@ -59,8 +65,8 @@ class Ws:
     """Klien WebSocket minimal (masked send, baca frame) di atas TLS."""
 
     def __init__(self, host, path, timeout=15):
-        raw = socket.create_connection((host, 443), timeout=timeout)
-        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        raw = socket.create_connection((host, PORT), timeout=timeout)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if USE_TLS else raw
         self.sock.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode()
         req = (
