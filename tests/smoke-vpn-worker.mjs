@@ -13,9 +13,12 @@
 //   7306 proxy HTTP-only kedua: menguji protokol proxy diingat antar koneksi
 //   7308 proxy "setengah mati": handshake sukses lalu tidak pernah mengirim data
 //   7309 REST proxy_pool palsu: menolak urutan tunnel_ok (400, kolom dianggap belum ada),
-//        tapi menjawab query urutan lama — untuk uji jalur mundur + ingatan
+//        tapi menjawab query urutan lama — untuk uji jalur mundur + ingatan. Tanpa filter
+//        negara ia mengembalikan DUA baris berurutan (7316 lalu 7302); tabel terpisah
+//        "proxy_pool_dead_first" mengembalikan baris pertama 127.0.0.1:7307 (tanpa pendengar)
 //   7311 proxy HTTP-only yang diam terhadap SOCKS5: uji race protokol
 //   7312 proxy yang mengirim 20 potongan 256 B berjarak ~1 ms: uji batching socket->WS
+//   7316 proxy HTTP-only ketiga: baris PERTAMA yang dikembalikan stub pool (uji "tercepat dulu")
 //
 // Skenario:
 //   1. DNS (cmd=2 port 53) framing Xray `[2B panjang][query]` -> balasan `00 00` + `[2B][jawaban]`
@@ -46,6 +49,10 @@
 //  23d. Path /XX: selector negara gagal-tertutup, bukan pindah ke proxy negara lain
 //  23e. Kolom tunnel_ok belum ada (400): pool tetap terisi lewat urutan lama, dan worker
 //       tidak mengulang percobaan urutan itu di pengambilan berikutnya (worker keenam)
+//  23f. Pool "tercepat dulu": /ALL memakai baris PERTAMA pool (7316) dan tidak menyentuh baris
+//       kedua (7302) selama yang teratas sehat
+//  23g. Baris pertama pool mati (127.0.0.1:7307) -> jalur cadangan tetap sampai baris kedua
+//       (7302) dan echo jalan; worker terpisah supaya cache pool kunci "all" bersih
 //  24. Early data lewat query ?ed= tanpa mengirim pesan WS
 //  25. Protokol belum diketahui: SOCKS5 & HTTP CONNECT dicoba paralel (bukan berurutan)
 //  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
@@ -78,6 +85,7 @@ const PORT_RELAY = PORT + 4;
 const PORT_ORDER = PORT + 5;
 const PORT_TOKEN = PORT + 6; // uji gerbang /health (HEALTH_TOKEN)
 const PORT_FREE = PORT + 7; // worker dari berkas tier Free (relay UDP diabaikan)
+const PORT_POOL_DEAD = PORT + 8; // worker pool dengan baris TERATAS mati (tabel pool terpisah)
 // Target IPv6 tetap untuk uji (2001:db8::1) — ditulis apa adanya supaya uji tidak memakai
 // parser yang sedang diuji.
 const IPV6_TARGET = "2001:db8::1";
@@ -241,9 +249,18 @@ function dnsAnswerFor(query) {
 }
 
 // --- stub pool proxy (meniru REST proxy_pool Supabase) --------------------------------
-// Mengembalikan satu baris {ip,port} yang menunjuk ke proxy HTTP-only 7302, supaya jalur
-// failover dari pool bisa diuji tanpa menyentuh Supabase. Urutan `tunnel_ok` selalu ditolak
-// 400: kolom itu ditambahkan lewat SQL manual, jadi worker harus tahan saat belum ada.
+// Tanpa filter negara, tabel mengembalikan DUA baris BERURUTAN seperti urutan pool asli
+// (tercepat dulu): tabel "proxy_pool" -> 7316 lalu 7302, tabel "proxy_pool_dead_first" ->
+// 127.0.0.1:7307 (tanpa pendengar) lalu 7302. Yang pertama membuktikan "baris teratas dipakai,
+// baris kedua tidak disentuh", yang kedua membuktikan jalur cadangan tetap sampai ke baris kedua
+// saat kandidat teratas mati. Alamat mati sengaja port lokal tanpa pendengar (pola uji failover
+// statis di skenario 15/23): SYN ke TEST-NET-1 (192.0.2.1) bisa menggantung puluhan detik,
+// sehingga pencatatan kegagalan proxy utama di /health tidak sempat terlihat di jendela uji.
+// Urutan `tunnel_ok` selalu ditolak 400: kolom itu ditambahkan lewat SQL manual, jadi worker
+// harus tahan saat belum ada.
+const POOL_TABLE_DEAD_FIRST = "proxy_pool_dead_first";
+const POOL_FAST_PORT = 7316; // baris pertama tabel "proxy_pool" (proxy HTTP-only + echo)
+const POOL_DEAD_PORT = 7307; // baris pertama tabel "proxy_pool_dead_first" (tidak ada pendengar)
 const startPoolStub = () =>
   new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
@@ -255,12 +272,17 @@ const startPoolStub = () =>
         res.end(JSON.stringify({ code: "42703", message: "column proxy_pool.tunnel_ok does not exist" }));
         return;
       }
-      // Jawab sesuai filter: tanpa filter -> "7302", SG -> "7306", negara lain -> kosong.
-      // Yang kosong dipakai untuk membuktikan selector negara gagal-tertutup.
+      // Jawab sesuai filter + tabel: tanpa filter -> dua baris tercepat-dulu, SG -> "7306",
+      // negara lain -> kosong. Yang kosong dipakai untuk membuktikan selector negara
+      // gagal-tertutup; tabel dead-first dipakai worker terpisah supaya cache pool per-filter
+      // (kunci "all") milik worker itu benar-benar bersih.
+      const table = (url.match(/\/rest\/v1\/([^?]*)/) || [])[1] || "";
       const filter = (url.match(/country=in\.\(([^)]*)\)/) || [])[1];
       const rows = filter
         ? (/SG/.test(filter) ? [{ ip: "127.0.0.1", port: 7306 }] : [])
-        : [{ ip: "127.0.0.1", port: 7302 }];
+        : (table === POOL_TABLE_DEAD_FIRST
+            ? [{ ip: "127.0.0.1", port: POOL_DEAD_PORT }, { ip: "127.0.0.1", port: 7302 }]
+            : [{ ip: "127.0.0.1", port: POOL_FAST_PORT }, { ip: "127.0.0.1", port: 7302 }]);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(rows));
     });
@@ -1286,7 +1308,7 @@ async function scenarioRotatePool(port) {
 }
 
 // Path "/SG": pool difilter negara, jadi proxy yang dipakai harus berasal dari baris SG
-// (stub pool mengembalikan 7306 untuk country=in.(SG), 7302 untuk permintaan lain).
+// (stub pool mengembalikan 7306 untuk country=in.(SG); tanpa filter negara 7316 lalu 7302).
 async function scenarioRotateCountry(port) {
   const payload = Buffer.from("PING");
   S.pool.requests = [];
@@ -1384,6 +1406,85 @@ async function scenarioPoolOrderFallback(port) {
   };
 }
 
+// "Tercepat dulu": stub pool (tabel "proxy_pool") mengembalikan 7316 sebagai baris PERTAMA lalu
+// 7302. Worker rotate harus memakai baris pertama itu — proxy yang lebih lambat di daftar tidak
+// boleh disentuh selama yang teratas sehat. Buktinya hitungan per porta (byPort) + echo yang
+// tetap jalan lewat HTTP CONNECT (connectLines mencatat "CONNECT ... HTTP/1.1").
+async function scenarioRotateFastestFirst(port) {
+  const payload = Buffer.from("PING");
+  const healthOf = async () => await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  S.proxy.byPort = {};
+  S.proxy.echoed = false;
+  const linesBefore = S.proxy.connectLines.length;
+  const before = await healthOf();
+  const { ws, received } = await openWs("/ALL", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+  const echoed = await until(() => received().length >= 8, 12000);
+  const got = received();
+  try { ws.close(); } catch {}
+  const after = await healthOf();
+
+  const delta = (key) => Number((after.counters || {})[key] || 0) - Number((before.counters || {})[key] || 0);
+  const echoOk = got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
+  const used = delta("rotateUsed");
+  const fastest = S.proxy.byPort[POOL_FAST_PORT] || 0; // baris pertama: harus dipakai
+  const second = S.proxy.byPort[7302] || 0; // baris kedua: 0 selama yang teratas sehat
+  const lines = S.proxy.connectLines.slice(linesBefore);
+  const httpLine = lines.some((line) => /^CONNECT .* HTTP\/1\./.test(line));
+  return {
+    name: "Pool tercepat dulu: /ALL memakai baris pertama (7316), baris kedua (7302) tidak disentuh",
+    pass: echoed && echoOk && used >= 1 && fastest >= 1 && second === 0 && httpLine,
+    detail: `echo=${echoOk} rotateUsed=+${used} byPort=${JSON.stringify(S.proxy.byPort)} connect=${JSON.stringify(lines)}`,
+  };
+}
+
+// Jalur cadangan tidak hilang karena "tercepat dulu": worker ini memakai tabel pool terpisah
+// ("proxy_pool_dead_first") yang baris PERTAMAnya mati (127.0.0.1:7307 — tidak ada pendengar),
+// baris kedua 7302 hidup. Echo yang sukses lewat 7302 membuktikan kandidat berikutnya dari
+// daftar yang sama tetap dicoba. Worker terpisah = isolate dan cache pool (kunci "all") bersih:
+// daftar pertama yang dilihatnya memang baris mati di depan, bukan daftar dari skenario lain.
+async function scenarioRotateFastestFailover(port) {
+  const payload = Buffer.from("PING");
+  const healthOf = async () => await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  S.proxy.byPort = {};
+  S.proxy.echoed = false;
+  const linesBefore = S.proxy.connectLines.length;
+  const before = await healthOf();
+  const { ws, received } = await openWs("/ALL", port);
+  ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+  const echoed = await until(() => received().length >= 8, 15000);
+  const got = received();
+  // Kandidat pertama (mati) bisa baru menyerah setelah timeout probe-nya (greeting SOCKS5
+  // 2500 ms, jalur HTTP sampai PROXY_HANDSHAKE_TIMEOUT), jadi counter proxyFail tidak muncul
+  // seketika — jalur cadangan (hedge) biasanya menang lebih dulu. Tunggu di situ selama WS
+  // masih terbuka supaya percobaan yang menggantung itu tidak dibatalkan oleh penutupan klien.
+  const baseFail = Number((before.counters || {}).proxyFail || 0);
+  let after = await healthOf();
+  for (let i = 0; i < 56 && Number((after.counters || {}).proxyFail || 0) <= baseFail; i++) {
+    await sleep(250);
+    after = await healthOf();
+  }
+  try { ws.close(); } catch {}
+
+  const delta = (key) => Number((after.counters || {})[key] || 0) - Number((before.counters || {})[key] || 0);
+  const echoOk = got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
+  const used = delta("rotateUsed");
+  const failed = delta("proxyFail"); // kandidat pertama (mati) memang dicoba lalu gagal
+  const fallbackUsed = Number(after.fallback_uses || 0) - Number(before.fallback_uses || 0);
+  const second = S.proxy.byPort[7302] || 0; // kandidat kedua: jalur yang harus dipakai
+  const notInList = S.proxy.byPort[POOL_FAST_PORT] || 0; // 7316 bukan bagian tabel ini -> tetap 0
+  const dead = S.proxy.byPort[POOL_DEAD_PORT] || 0; // port mati tidak punya stub -> tetap 0
+  const lines = S.proxy.connectLines.slice(linesBefore);
+  const httpLine = lines.some((line) => /^CONNECT .* HTTP\/1\./.test(line));
+  return {
+    name: "Pool tercepat gagal: kandidat pertama mati -> echo tetap lewat kandidat kedua (7302)",
+    pass: echoed && echoOk && used >= 1 && second >= 1 && notInList === 0 && dead === 0 &&
+      failed >= 1 && fallbackUsed >= 1 && httpLine,
+    detail: `echo=${echoOk} rotateUsed=+${used} proxyFail=+${failed} fallback_uses=+${fallbackUsed} ` +
+      `byPort=${JSON.stringify(S.proxy.byPort)} connect=${JSON.stringify(lines)}`,
+  };
+}
+
 // Gerbang /health: dengan env.HEALTH_TOKEN, /health menutup hitungan internal kecuali token
 // dikirim lewat ?token= atau header x-health-token. Tanpa env, endpoint tetap terbuka (uji lain
 // memakainya bebas).
@@ -1432,7 +1533,7 @@ try {
   const dohStub = await startDoh();
   const udpEcho = await startUdpEcho();
   const relay = startRelay();
-  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startSocks(), await startSilentProxy(), await startRaceProxy(), await startStreamProxy(), await startPoolStub(), udpEcho, dohStub);
+  stubs.push(await startRaw(), await startProxy(), await startProxy(7306), await startProxy(POOL_FAST_PORT), await startSocks(), await startSilentProxy(), await startRaceProxy(), await startStreamProxy(), await startPoolStub(), udpEcho, dohStub);
 
   workdirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-")));
   makeFixture(workdirs[0], {
@@ -1520,6 +1621,8 @@ try {
   results.push(await scenarioRotatePool(PORT_POOL));
   results.push(await scenarioRotateCountry(PORT_POOL));
   results.push(await scenarioCountryClosed(PORT_POOL));
+  // Baris pertama pool (7316) yang harus dipakai, bukan baris kedua (7302): "tercepat dulu".
+  results.push(await scenarioRotateFastestFirst(PORT_POOL));
 
   // Worker kelima: relay UDP (proses proxy-relay/udp-relay.mjs di atas) untuk UDP non-DNS.
   workers.push(relay); // ikut dimatikan di finally via killTree
@@ -1574,6 +1677,24 @@ try {
     throw new Error("wrangler dev (uji urutan pool) tidak siap pada port " + PORT_ORDER + "\n" + orderWorker.getOut().slice(-1500));
   }
   results.push(await scenarioPoolOrderFallback(PORT_ORDER));
+
+  // Worker terpisah untuk pool dengan baris TERATAS mati (FALLBACK_TABLE sendiri). Isolate-nya
+  // sendiri supaya cache pool kunci "all" di sini benar-benar bersih: daftar pertama yang
+  // dipakai skenario ini memang memuat baris mati di depan, bukan daftar dari worker lain.
+  const deadDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-pool-dead-"));
+  workdirs.push(deadDir);
+  makeFixture(deadDir, {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    FALLBACK_POOL: "on",
+    FALLBACK_POOL_URL: "http://127.0.0.1:7309",
+    FALLBACK_TABLE: POOL_TABLE_DEAD_FIRST,
+  });
+  const deadWorker = startWorker(deadDir, PORT_POOL_DEAD);
+  workers.push(deadWorker);
+  if (!(await waitPort(PORT_POOL_DEAD, 120000))) {
+    throw new Error("wrangler dev (uji pool tercepat-gagal) tidak siap pada port " + PORT_POOL_DEAD + "\n" + deadWorker.getOut().slice(-1500));
+  }
+  results.push(await scenarioRotateFastestFailover(PORT_POOL_DEAD));
 
   // Worker ketujuh: /health digerbang HEALTH_TOKEN.
   const tokenDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-token-"));

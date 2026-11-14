@@ -82,10 +82,12 @@ async function generateLocalConfigs(params) {
     const countryList = (params.ccList || []).map((cc) => String(cc).trim().toUpperCase()).filter((cc) => /^[A-Z]{2}$/.test(cc));
     const country = [...new Set(countryList)].join(",");
     const path = country ? "/" + country : "/ALL";
+    // `sni` hanya ditulis kalau TLS: parameter kosong membuat sebagian klien menolak config.
     const query = new URLSearchParams({
       encryption: "none", type: "ws", host: params.host,
-      security: tls ? "tls" : "none", sni: tls ? params.host : "", path,
+      security: tls ? "tls" : "none", path,
     });
+    if (tls) query.set("sni", params.host);
     const label = `1 CFVPN WS ${tls ? "TLS" : "NTLS"} [${country || "ALL"}] [${params.serviceName}]`;
     return formatConfigs([`vless://${uuid}@${params.host}:${port}?${query}#${encodeURIComponent(label)}`], params.format);
   }
@@ -144,7 +146,8 @@ async function generateLocalConfigs(params) {
       const path = `/${proxy.prxIP}-${proxy.prxPort}`;
       const label = `${configs.length + 1} ${getFlagEmoji(proxy.country)} ${proxy.org} WS ${tls ? "TLS" : "NTLS"} [${params.serviceName}]`;
       
-      const query = new URLSearchParams({ encryption: "none", type: "ws", host: params.host, security: tls ? "tls" : "none", sni: tls ? params.host : "", path });
+      const query = new URLSearchParams({ encryption: "none", type: "ws", host: params.host, security: tls ? "tls" : "none", path });
+      if (tls) query.set("sni", params.host);
       const config = `vless://${uuid}@${params.host}:${port}?${query}#${encodeURIComponent(label)}`;
       configs.push(config);
     }
@@ -549,19 +552,26 @@ function proxyHealth(list, countries) {
     const t = Date.parse(p.checked || "");
     return Number.isFinite(t) && (now - t) < PROXY_FRESH_MS;
   });
+  const verifiedList = fresh.filter((p) => p.tunnel === true);
+  const usable = fresh.filter((p) => p.tunnel !== false);
   return {
     total: scope.length,
     fresh: fresh.length,
-    verified: fresh.filter((p) => p.tunnel === true).length,
+    verifiedCount: verifiedList.length,
     knownDead: fresh.filter((p) => p.tunnel === false).length,
-    usable: fresh.filter((p) => p.tunnel !== false),
-    verified: fresh.filter((p) => p.tunnel === true),
+    usable: usable.slice().sort(proxySpeed),
+    verified: verifiedList.slice().sort(proxySpeed),
     // Kalau sudah ada cukup baris yang terbukti tembus tunnel, tawarkan hanya itu: baris yang
     // belum pernah diprobe masih untung-untungan, dan cron hampir selalu mematikan separuhnya.
-    preferred: fresh.filter((p) => p.tunnel === true).length >= 2
-      ? fresh.filter((p) => p.tunnel === true)
-      : fresh.filter((p) => p.tunnel !== false),
+    preferred: (verifiedList.length >= 2 ? verifiedList.slice() : usable.slice()).sort(proxySpeed),
   };
+}
+
+// Tercepat dulu: tunnel_ms (hasil tunnel nyata yang diukur cron) → ping cek ringan → sisanya
+// di belakang. Urutan ini yang dipakai daftar proxy maupun mode rotasi.
+function proxySpeed(a, b) {
+  const speed = (p) => (p.tunnelMs > 0 ? p.tunnelMs : (p.ping > 0 ? p.ping + 1000 : 1e9));
+  return speed(a) - speed(b);
 }
 
 function renderGenerator() {
@@ -604,11 +614,12 @@ function renderGenerator() {
     const h = proxyHealth(allProxies, cc);
     const flag = cc.map(c => `${getFlagEmoji(c)} ${c}`).join(" + ");
     const parts = [`${flag}: ${h.fresh} dari ${h.total} proxy masih segar`];
-    if (h.verified) parts.push(`${h.verified} terverifikasi tunnel`);
+    if (h.verifiedCount) parts.push(h.verifiedCount + " terverifikasi tunnel");
     else if (h.knownDead) parts.push(`${h.knownDead} terbukti mati`);
     else parts.push("belum ada yang terverifikasi tunnel");
     let text = parts.join(" · ");
     if (!h.usable.length) text += " — kemungkinan gagal: tidak ada proxy siap pakai, pakai /ALL atau negara lain.";
+    if (h.verified.length) text += " · tercepat " + h.verified[0].tunnelMs + " ms";
     el.textContent = text;
     el.classList.toggle("error", h.usable.length === 0);
   };
@@ -691,6 +702,7 @@ function renderGenerator() {
       else if (cc.length) info += ` · ${cc.map(c => `${getFlagEmoji(c)} ${c}`).join("+")}`;
       else info += ` · semua negara`;
       if (org) info += ` · ${org}`;
+      if (!worker.uuid) info += " · ⚠ UUID belum terikat (deploy ulang dari panel)";
       if (rotate) info += ` · path ${cc.length ? "/" + cc.join(",") : "/ALL"}`;
       $("urlPreview").textContent = info;
     }
@@ -736,6 +748,13 @@ function renderGenerator() {
       } else {
         const worker = selectedWorker();
         if (!worker) return setMessage("formMessage", "Pilih VPN Worker aktif dulu.", true);
+        // Worker yang di-deploy panel mengunci UUID lewat binding UUID_ALLOWLIST. Kalau state
+        // tidak menyimpan UUID-nya (worker lama / ditambah manual), config hasil generate akan
+        // membawa UUID acak yang pasti ditolak worker — lebih baik ditolak di sini dengan pesan
+        // jelas daripada user bingung kenapa "tersambung lalu putus".
+        if (!worker.uuid) {
+          return setMessage("formMessage", "Worker ini belum punya UUID terikat. Deploy ulang worker dari halaman Deploy supaya UUID-nya tercatat, lalu generate lagi (atau pakai config lama yang masih memakai UUID tersebut).", true);
+        }
         const ccList = selectedCountries();
         const orgValue = orgSelect.value;
         const rotate = $("rotateMode")?.checked === true;

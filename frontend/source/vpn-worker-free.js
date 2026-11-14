@@ -69,7 +69,9 @@ const poolFetching = new Map();
 // Urutan pool: proxy yang terbukti bisa dibuat tunnel dulu (tunnel_ok true -> null/belum
 // diprobe -> false), baru ping tercepat. Proyeksi `select` tidak ikut berubah — tunnel_ok
 // hanya dipakai untuk mengurutkan.
-const POOL_ORDER_TUNNEL_OK = "tunnel_ok.desc.nullslast,ping.asc.nullslast";
+// Tercepat dulu: baris terverifikasi tunnel di atas, lalu menurut waktu tunnel nyata
+// (tunnel_ms), baru ping cek ringan. Dengan urutan ini pilihan pertama selalu yang tercepat.
+const POOL_ORDER_TUNNEL_OK = "tunnel_ok.desc.nullslast,tunnel_ms.asc.nullslast,ping.asc.nullslast";
 const POOL_ORDER_PING = "ping.asc.nullslast";
 // Kolom tunnel_ok ditambahkan manual ke tabel proxy_pool; selama belum ada, PostgREST
 // menolak urutan yang menyebutnya (400). Sekali ketahuan tidak ada, jangan bayar dua
@@ -1030,7 +1032,12 @@ async function pickRotateProxy(env, countries) {
     if (unique.length >= ROTATE_POOL_LIMIT) break;
   }
   if (!unique.length) return null;
-  return unique[Math.floor(Math.random() * unique.length)];
+  // Tercepat dulu: urutan kandidat datang dari server (tunnel_ok, lalu tunnel_ms, lalu ping),
+  // jadi kandidat pertama memang yang paling cepat. Konsekuensinya beban menumpuk di proxy
+  // teratas; itu diterima karena yang dicari adalah koneksi paling cepat, dan kalau proxy itu
+  // ternyata gagal, jalur cadangan (`fallbackCandidates`: hedge + FALLBACK_MAX) tetap mencoba
+  // kandidat berikutnya dari daftar yang sama.
+  return unique[0];
 }
 
 function staticFallbackProxies(env) {
