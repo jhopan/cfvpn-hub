@@ -30,8 +30,9 @@ comment on column public.proxy_pool.tunnel_host_ok      is 'Probe tunnel terakhi
 comment on column public.proxy_pool.tunnel_host_ms      is 'Durasi probe tunnel host (ms) saat tunnel_host_ok terakhir ditulis; NULL kalau gagal/timeout';
 comment on column public.proxy_pool.tunnel_host_checked is 'Waktu probe tunnel host terakhir; scanner memakai kolom ini untuk giliran (paling lama diprobe lebih dulu)';
 
--- Giliran probe host: baris aktif yang paling lama tidak diprobe didahulukan, NULL (belum pernah)
--- paling awal — sama polanya dengan proxy_pool_active_tunnel_idx untuk probe edge.
+-- Index giliran probe host: belum dipakai kode mana pun (panproxyscanner hanya MENULIS kolom
+-- ini, tidak membacanya), disiapkan untuk kalau nanti ada probe host terjadwal yang butuh
+-- "paling lama tidak diprobe lebih dulu" — pola yang sama dengan proxy_pool_active_tunnel_idx.
 create index if not exists proxy_pool_active_tunnel_host_idx
   on public.proxy_pool (is_active, tunnel_host_checked asc nulls first);
 
