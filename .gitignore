@@ -17,3 +17,6 @@ __pycache__/
 vless-id.yaml
 # artefak uji xray yang pernah ikut ter-commit (berisi UUID hidup)
 test-xray-vless.json
+
+# cache CLI Supabase (dibuat/dihapus otomatis saat `db query`)
+supabase/.temp/

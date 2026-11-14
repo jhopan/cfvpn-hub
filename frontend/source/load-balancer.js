@@ -1,8 +1,16 @@
 // Load Balancer & Subscription Worker for CFVPN Hub
 // Mengambil proxy hidup dari Supabase (berdasarkan Ping terbaik) dan merakit config VLESS
 
-// Narik dengan urutan latensi terendah (ping ascending)
-const SUPABASE_URL = "https://lumbbmhhmkcnxunuryjr.supabase.co/rest/v1/proxy_pool?select=*&is_active=eq.true&order=ping.asc.nullslast";
+// Pemilihan proxy memakai tingkat bukti yang sama dengan worker VPN: verdict EDGE (tunnel_ok, diisi
+// cron-worker) > bukti host TLS (tls_ok) > bukti tunnel host scanner (tunnel_host_ok) > ping.
+// Baris yang di edge TERBUKTI MATI (tunnel_ok = false) tidak ikut sama sekali: worker VLESS
+// berjalan di edge, jadi vonis edge yang menentukan (pengukuran 15 Nov: 87 dari 276 baris aktif).
+const SUPABASE_BASE = "https://lumbbmhhmkcnxunuryjr.supabase.co/rest/v1/proxy_pool?select=*&is_active=eq.true";
+const SUPABASE_URL = SUPABASE_BASE +
+  "&or=(tunnel_ok.is.null,tunnel_ok.eq.true)" +
+  "&order=tunnel_ok.desc.nullslast,tls_ok.desc.nullslast,tunnel_host_ok.desc.nullslast,ping.asc.nullslast";
+// Cadangan kalau kolom bukti belum ada di tabel (migrasi belum dijalankan): urut ping saja.
+const SUPABASE_URL_FALLBACK = SUPABASE_BASE + "&order=ping.asc.nullslast";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1bWJibWhobWtjbnh1bnVyeWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0NzI1MjEsImV4cCI6MjExMDA0ODUyMX0.ylMqMgv2H4vWax-whnXSRHBlD7DZs9DXVRUD9fAO6mc";
 
 const CORS_HEADERS = {
@@ -28,12 +36,12 @@ export default {
 
 async function getLiveProxies() {
   try {
-    const response = await fetch(SUPABASE_URL, {
-      headers: {
-        "apikey": SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`
-      }
-    });
+    const headers = { "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}` };
+    let response = await fetch(SUPABASE_URL, { headers });
+    if (!response.ok) {
+      // Kolom bukti belum ada (migrasi belum jalan) -> pakai urutan lama supaya langganan tetap hidup.
+      response = await fetch(SUPABASE_URL_FALLBACK, { headers });
+    }
     if (response.ok) {
       return await response.json();
     }
@@ -79,7 +87,7 @@ async function generateSubscription(url, env) {
   }
 
   // SOLUSI TERBAIK:
-  // Karena API sudah narik data secara urut Ping terkecil (order=ping.asc.nullslast),
+  // Karena API sudah narik data secara urut bukti lalu ping (lihat SUPABASE_URL),
   // kita ambil (slice) jumlah 2x lipat dari limit permintaan user untuk menjaga kualitas elit.
   const elitPoolSize = filterLimit * 2;
   if (proxyList.length > elitPoolSize) {
