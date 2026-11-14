@@ -234,6 +234,8 @@ dan halaman Generator menandai baris terverifikasi dengan ✓.
 
 **Batas role:** user biasa hanya mendapat Worker Free. Field versi Worker disembunyikan dan backend frontend selalu memilih `vpn-worker-free.js`. Admin dapat memilih Free atau Premium.
 
+**Beda Free vs Premium:** hanya satu konstanta di script worker (`TIER_FREE`). Di Free, relay UDP tidak dipakai walau binding-nya dipasang; sisa kode identik, jadi tidak ada fitur lain yang berbeda dan perbaikan bug berlaku untuk kedua tier.
+
 ### Memilih proxy dari path (selector)
 
 Path kedua URL WebSocket menentukan proxy mana yang dipakai worker:

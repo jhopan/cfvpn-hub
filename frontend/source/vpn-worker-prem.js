@@ -14,6 +14,12 @@
 
 import { connect } from "cloudflare:sockets";
 
+// Satu-satunya beda script ini dengan vpn-worker-free.js. Tier Free tidak memakai fitur
+// premium yang butuh binding/env tambahan (relay UDP); sisanya kode yang sama persis supaya bug
+// yang diperbaiki di satu tier tidak tertinggal di tier lain.  yang
+// menurunkan berkas free dari berkas ini (hanya baris ini yang berubah).
+const TIER_FREE = false;
+
 // Query DNS (cmd=2, port 53) dijawab langsung oleh worker lewat DoH: relay UDP
 // eksternal tidak dipakai lagi (keduanya sudah tidak bisa dihubungi). Endpoint bisa
 // dioverride lewat env.DOH_ENDPOINT — dipakai oleh tests/smoke-vpn-worker.mjs.
@@ -1795,6 +1801,9 @@ async function muxUdpQuery(state, webSocket, env, id, frame, data) {
 const MAX_UDP_DATAGRAM = 8192;
 
 function udpRelayConfig(env) {
+  // Tier Free: relay UDP adalah fitur premium, jadi binding RELAY_SERVER_UDP diabaikan walau ada
+  // (panel juga tidak pernah mengirimkannya untuk tier Free).
+  if (TIER_FREE) return null;
   const host = env && env.RELAY_SERVER_UDP;
   if (!host) return null;
   return {

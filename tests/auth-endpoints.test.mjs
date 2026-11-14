@@ -51,8 +51,8 @@ function post(path, body, ip) {
   });
 }
 
-function context(path, body, ip) {
-  return { request: post(path, body, ip), env: {} };
+function context(path, body, ip, env) {
+  return { request: post(path, body, ip), env: env || {} };
 }
 
 async function readJson(response) {
@@ -253,16 +253,18 @@ test("batas global: bump_rate false menolak 429, IP lain tidak terpengaruh", asy
   });
 });
 
-test("register memakai kunci dan jatah bump_rate sendiri", async () => {
+test("register memakai kunci dan jatah bump_rate sendiri (limit dari env)", async () => {
   const routes = [BUMP_OK, ["register_user", () => jsonReply(true, 200)]];
   await withFetch(routes, async (calls) => {
-    const response = await register(context("/api/register", { username: "ci-1750001", password: "rahasia" }, "198.51.100.79"));
+    // Limit dikirim lewat env supaya uji ini mengukur jalur env -> bump_rate, bukan angka bawaan
+    // yang sengaja bisa berubah tanpa mematahkan tes.
+    const response = await register(context("/api/register", { username: "ci-1750001", password: "rahasia" }, "198.51.100.79", { REGISTER_RATE_LIMIT: "7", REGISTER_RATE_WINDOW_SEC: "300" }));
     assert.equal(response.status, 200);
     const call = calls.find((item) => item.url.includes("bump_rate"));
     assert.ok(call, "bump_rate harus dipanggil");
     assert.match(call.body.p_key, /^register:198\.51\.100\.79:\d+$/);
-    assert.equal(call.body.p_limit, 5);
-    assert.equal(call.body.p_window_sec, 600);
+    assert.equal(call.body.p_limit, 7);
+    assert.equal(call.body.p_window_sec, 300);
   });
 });
 

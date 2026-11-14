@@ -11,7 +11,9 @@
 import { checkRateLimit, checkGlobalRateLimit } from "./lib/rate-limit.js";
 import { rpc } from "./lib/supabase.js";
 
-const REGISTER_RATE_LIMIT = 5;
+// 10 pendaftaran / 10 menit per IP: cukup untuk keluarga/kantor berbagi IP, tetap membatasi
+// pembuatan akun massal dari satu alamat.
+const REGISTER_RATE_LIMIT = 10;
 const REGISTER_RATE_WINDOW_SEC = 600;
 // Sandi minimal 6 karakter: aturan yang sama dipakai register_user di
 // sql/2026-11-14-auth-hardening.sql, jadi ditolak lebih awal di sini.

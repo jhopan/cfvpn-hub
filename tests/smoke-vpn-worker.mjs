@@ -51,8 +51,12 @@
 //  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
 //  27. Batching dimatikan (WS_BATCH_MS=0): satu pesan per potongan (pembanding)
 //  28. Log dibatasi: 3 kegagalan proxy -> 1 baris log, counter /health tetap naik
+//  29. UDP non-DNS lewat relay memang jalan di prem (header "udp <alamat> <port> <rahasia>" ke
+//      relay, balasan datang) — pembanding untuk tier Free
+//  30. Tier Free: binding RELAY_SERVER_UDP diabaikan -> UDP non-DNS ditutup cepat, tidak ada
+//      satu pun lalu lintas relay (relay tidak mencatat sesi ke port tujuan itu)
 //
-// Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+5).
+// Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+7).
 import net from "node:net";
 import http from "node:http";
 import dgram from "node:dgram";
@@ -73,6 +77,7 @@ const PORT_POOL = PORT + 3;
 const PORT_RELAY = PORT + 4;
 const PORT_ORDER = PORT + 5;
 const PORT_TOKEN = PORT + 6; // uji gerbang /health (HEALTH_TOKEN)
+const PORT_FREE = PORT + 7; // worker dari berkas tier Free (relay UDP diabaikan)
 // Target IPv6 tetap untuk uji (2001:db8::1) — ditulis apa adanya supaya uji tidak memakai
 // parser yang sedang diuji.
 const IPV6_TARGET = "2001:db8::1";
@@ -401,8 +406,9 @@ const startDoh = () =>
     server.listen(7303, "127.0.0.1", () => resolve(server));
   });
 
-function makeFixture(dir, vars) {
-  const src = fs.readFileSync(SOURCE, "utf8");
+// `source` opsional: tier Free memakai berkas vpn-worker-free.js, sisanya prem.
+function makeFixture(dir, vars, source = SOURCE) {
+  const src = fs.readFileSync(source, "utf8");
   fs.writeFileSync(path.join(dir, "worker.local.mjs"), src);
   const lines = Object.entries(vars).map(([key, value]) => `${key} = "${value}"`).join("\n");
   fs.writeFileSync(
@@ -1192,6 +1198,49 @@ async function scenarioUdpRelay(port, relayLog) {
   };
 }
 
+// Tier Free: `udpRelayConfig(env)` langsung `return null`, jadi binding RELAY_SERVER_UDP
+// diabaikan walau ada. UDP non-DNS harus ditutup cepat TANPA satu pun lalu lintas relay —
+// pembandingnya skenario prem di atas, yang memang mengirim header relay dan dicatat relay
+// lewat baris "sesi ... -> <alamat>:<port>".
+async function scenarioFreeTierRelayBlocked(port, relayLog) {
+  const logBefore = relayLog() || "";
+  S.udp.messages = 0;
+  S.udp.last = "";
+  const payload = Buffer.from("PINGUDP");
+  const { ws, received, isClosed } = await openWs("/127.0.0.1:7302", port);
+  ws.send(frame({ cmd: 2, host: "127.0.0.1", port: 5353, payload: prefixed(payload) }));
+  const closed = await until(() => isClosed(), 5000);
+  await until(() => false, 400); // beri jendela kalau balasan menyusul
+  const got = received();
+  const udpEcho = S.udp.messages;
+  try { ws.close(); } catch {}
+
+  const penuh = relayLog() || "";
+  const delta = penuh.slice(logBefore.length);
+  // Header relay berisi "udp 127.0.0.1 5353 <rahasia>", dan sesi sukses tercatat sebagai
+  // "-> 127.0.0.1:5353". Keduanya tidak boleh muncul — di delta maupun di seluruh log.
+  const relayMenyentuh = /127\.0\.0\.1:5353/.test(penuh);
+  const premSesi7314 = /-> 127\.0\.0\.1:7314/.test(penuh);
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  const counters = (health && health.counters) || {};
+  return {
+    name: "Tier Free: relay UDP diabaikan, UDP non-DNS ditutup tanpa lalu lintas relay",
+    pass:
+      closed &&
+      got.length === 0 &&
+      udpEcho === 0 &&
+      !relayMenyentuh &&
+      premSesi7314 &&
+      counters.udpUnsupported >= 1 &&
+      !counters.udpRelayUsed,
+    detail:
+      `wsTertutup=${closed} byteBalasan=${got.length} udpEcho=${udpEcho} ` +
+      `relaySentuh5353=${relayMenyentuh} premKirimHeaderRelay=${premSesi7314} ` +
+      `counters=${JSON.stringify({ udpUnsupported: counters.udpUnsupported, udpRelayUsed: counters.udpRelayUsed })} ` +
+      `deltaLogRelay=${JSON.stringify(delta.slice(-200))}`,
+  };
+}
+
 // Path ajaib "/rotate": worker memilih proxy sendiri (daftar statis FALLBACK_PROXIES).
 async function scenarioRotateStatic(port) {
   const payload = Buffer.from("PING");
@@ -1362,9 +1411,15 @@ async function scenarioHealthToken(port, token) {
 }
 
 function tierCheck() {
-  const prem = fs.readFileSync(SOURCE);
-  const free = fs.readFileSync(SOURCE_FREE);
-  return { name: "vpn-worker-free.js identik dengan vpn-worker-prem.js", pass: prem.equals(free), detail: `prem=${prem.length}B free=${free.length}B` };
+  const prem = fs.readFileSync(SOURCE, "utf8").split("\n");
+  const free = fs.readFileSync(SOURCE_FREE, "utf8").split("\n");
+  const beda = prem.filter((line, i) => line !== free[i]);
+  const hanyaKonstanta = beda.length === 1 && /^const TIER_FREE = /.test(beda[0]);
+  return {
+    name: "vpn-worker-free.js = turunan prem (beda hanya konstanta TIER_FREE)",
+    pass: hanyaKonstanta,
+    detail: "beda=" + beda.length + " " + JSON.stringify(beda.slice(0, 3)),
+  };
 }
 
 const stubs = [];
@@ -1484,6 +1539,24 @@ try {
     throw new Error("wrangler dev (uji relay UDP) tidak siap pada port " + PORT_RELAY + "\n" + workers[workers.length - 1].getOut().slice(-1500));
   }
   results.push(await scenarioUdpRelay(PORT_RELAY, () => relay.getOut()));
+
+  // Worker kedelapan: berkas tier Free dengan env relay yang SAMA seperti worker prem di atas.
+  // Buktinya jadi bermakna: setup relay identik, yang berbeda cuma sumber worker.
+  const freeDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-free-"));
+  workdirs.push(freeDir);
+  makeFixture(freeDir, {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    RELAY_SERVER_UDP: "127.0.0.1",
+    RELAY_SERVER_PORT: "7313",
+    RELAY_SECRET: "uji",
+    FALLBACK_POOL: "off",
+  }, SOURCE_FREE);
+  const freeWorker = startWorker(freeDir, PORT_FREE);
+  workers.push(freeWorker);
+  if (!(await waitPort(PORT_FREE, 120000))) {
+    throw new Error("wrangler dev (uji tier Free) tidak siap pada port " + PORT_FREE + "\n" + freeWorker.getOut().slice(-1500));
+  }
+  results.push(await scenarioFreeTierRelayBlocked(PORT_FREE, () => relay.getOut()));
 
   // Worker keenam: urutan pool saat kolom tunnel_ok belum ada. Isolate harus bersih supaya
   // percobaan 400 -> ulangi benar-benar terjadi di skenario 23e, bukan tersembunyi di ingatan

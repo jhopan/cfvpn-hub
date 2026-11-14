@@ -5,12 +5,15 @@
 // tahu harus memakai jalur lama (baca users_custom langsung), bukan menganggap sandi salah.
 //
 // Pagar berlapis: limiter Cache API (prefilter murah per-colo) lalu batas GLOBAL lintas-colo
-// lewat RPC bump_rate. Bawaan 10 percobaan / 600 detik per IP; env LOGIN_RATE_LIMIT dan
+// lewat RPC bump_rate. Bawaan 30 percobaan / 600 detik per IP; env LOGIN_RATE_LIMIT dan
 // LOGIN_RATE_WINDOW_SEC bisa menimpanya.
 import { checkRateLimit, checkGlobalRateLimit } from "./lib/rate-limit.js";
 import { rpc } from "./lib/supabase.js";
 
-const LOGIN_RATE_LIMIT = 10;
+// Longgar dengan sengaja: panel ini publik dan loginnya cuma username+sandi. 30 percobaan per
+// 10 menit per IP cukup untuk salah ketik berulang, tetap membatasi brute force, dan tidak
+// menghukum beberapa orang yang berbagi satu IP.
+const LOGIN_RATE_LIMIT = 30;
 const LOGIN_RATE_WINDOW_SEC = 600;
 // Kunci cache dipisah per route (host .invalid yang sama, path berbeda) supaya jatah /api/cf,
 // /api/login, dan /api/register tidak saling mengurangi di colo yang sama.
