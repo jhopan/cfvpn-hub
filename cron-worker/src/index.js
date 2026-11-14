@@ -141,8 +141,12 @@ async function inspectProxy(supabase, row, connectFn, state, stats) {
   console.log("Proxy " + row.ip + ":" + row.port + " -> " +
     (tunnel.ok ? "TEMBUS " + tunnel.protocol + " " + tunnel.ms + "ms (" + tunnel.detail + ")" : "GAGAL (" + tunnel.detail + ")"));
 
+  // Hanya MEMATIKAN. Yang berhak menyalakan baris adalah panproxyscanner (pipeline produksi,
+  // aturan di repo Pan-ProxyScanner: cron panel dan pull-verify tidak boleh menyalakan). Di sini
+  // kita mencatat bukti (ping/tunnel_*) dan mematikan yang terbukti gagal; baris yang gagal
+  // sesaat akan dinyalakan lagi oleh siklus scraper berikutnya.
   const fields = tunnel.ok
-    ? { is_active: true, last_checked: now, ping: tunnel.ms }
+    ? { last_checked: now, ping: tunnel.ms }
     : { is_active: false, last_checked: now, ping: null };
   const tunnelFields = { tunnel_ok: tunnel.ok, tunnel_ms: tunnel.ok ? tunnel.ms : null, tunnel_checked: now };
   await patchProxy(supabase, row.id, fields, tunnelFields, state);
