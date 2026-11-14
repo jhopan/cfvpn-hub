@@ -16,6 +16,16 @@ const PROBE_PORT = 80;
 const PROBE_REQUEST = "GET / HTTP/1.0\r\nHost: " + PROBE_HOST + "\r\n\r\n";
 const CONNECT_REQUEST = "CONNECT " + PROBE_HOST + ":" + PROBE_PORT + " HTTP/1.1\r\n" +
   "Host: " + PROBE_HOST + ":" + PROBE_PORT + "\r\nUser-Agent: Mozilla/5.0\r\n\r\n";
+// Target bisa diubah: cron memakai example.com:80 untuk bukti tembus, sedangkan scraper memakai
+// 443 + TLS (cdn-cgi/trace) untuk sekaligus membuktikan proxy sanggup TLS dan membaca negara
+// keluar yang sebenarnya. `startTls` hanya ada di sebagian runtime (workerd punya, tapi tanpa
+// kontrol SNI — jadi jalur TLS dipakai dari Node, bukan dari worker).
+function connectRequest(host, port) {
+  return "CONNECT " + host + ":" + port + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\nUser-Agent: Mozilla/5.0\r\n\r\n";
+}
+function probeRequest(host, reqPath) {
+  return "GET " + reqPath + " HTTP/1.0\r\nHost: " + host + "\r\n\r\n";
+}
 const MAX_HEAD_BYTES = 8192;
 const MAX_REPLY_BYTES = 8192;
 const EMPTY = new Uint8Array(0);
@@ -209,11 +219,11 @@ class ByteReader {
   }
 }
 
-async function openHttpConnect(sock, deadline) {
+async function openHttpConnect(sock, deadline, target) {
   const writer = sock.writable.getWriter();
   const reader = new ByteReader(sock.readable.getReader());
   try {
-    await writer.write(new TextEncoder().encode(CONNECT_REQUEST));
+    await writer.write(new TextEncoder().encode(connectRequest(target.host, target.port)));
     // Byte pertama harus 'H' ("HTTP/..."): proxy SOCKS5-only membalas byte 0x05 lalu menahan
     // koneksi, dan menunggu "\r\n\r\n" di situ menghabiskan deadline penuh (~6 s) per baris.
     const first = await reader.peek(1, deadline, "http-connect");
@@ -228,13 +238,13 @@ async function openHttpConnect(sock, deadline) {
   }
 }
 
-async function openSocks5(sock, deadline) {
+async function openSocks5(sock, deadline, target) {
   const writer = sock.writable.getWriter();
   const reader = new ByteReader(sock.readable.getReader());
   try {
     await writer.write(buildSocks5Greeting());
     parseSocks5Greeting(await reader.read(2, deadline, "socks5-greeting"));
-    await writer.write(buildSocks5Connect(PROBE_HOST, PROBE_PORT));
+    await writer.write(buildSocks5Connect(target.host, target.port));
     const reply = parseSocks5Reply(await reader.read(4, deadline, "socks5-reply"));
     const lengthByte = reply.atyp === 0x03 ? (await reader.read(1, deadline, "socks5-bind-length"))[0] : undefined;
     await reader.read(socks5BindLength(reply.atyp, lengthByte), deadline, "socks5-bind");
@@ -249,11 +259,13 @@ async function openSocks5(sock, deadline) {
 // Kirim permintaan probe lalu tunggu "HTTP/1." pada byte yang terkumpul. Timeout/penutupan
 // koneksi diputuskan dari byte yang sudah ada: balasan yang datang penuh lalu langsung ditutup
 // (perilaku HTTP/1.0) tetap dihitung tembus.
-async function probeHttp(tunnel, deadline) {
-  await tunnel.writer.write(new TextEncoder().encode(PROBE_REQUEST));
+async function probeHttp(tunnel, deadline, request) {
+  tunnel.reader.lastText = "";
+  await tunnel.writer.write(new TextEncoder().encode(request));
   let text = toText(tunnel.reader.buf);
   tunnel.reader.buf = EMPTY;
   for (;;) {
+    tunnel.reader.lastText = text;
     if (hasHttp10Reply(text)) return text.split("\r\n")[0];
     if (text.length > MAX_REPLY_BYTES) throw new Error("balasan terlalu besar");
     try {
@@ -273,6 +285,12 @@ async function probeHttp(tunnel, deadline) {
 export async function probeTunnel(host, port, connectFn, options) {
   const opts = options || {};
   const timeoutMs = opts.timeoutMs || 6000;
+  const target = {
+    host: opts.targetHost || PROBE_HOST,
+    port: opts.targetPort || PROBE_PORT,
+    path: opts.path || "/",
+  };
+  const request = opts.request || probeRequest(target.host, target.path);
   const attempts = [];
   const started = Date.now();
 
@@ -283,9 +301,13 @@ export async function probeTunnel(host, port, connectFn, options) {
     let tunnel = null;
     try {
       sock = await connectFn({ hostname: host, port: port });
-      tunnel = await attempt.open(sock, deadline);
-      const line = await probeHttp(tunnel, deadline);
-      return { ok: true, protocol: attempt.protocol, ms: Date.now() - attemptStart, detail: line };
+      // TLS di atas tunnel: hanya kalau runtime menyediakan startTls (Node via scraper).
+      if (opts.tls && typeof sock.startTls === "function") {
+        sock = await sock.startTls({ serverName: opts.serverName || target.host });
+      }
+      tunnel = await attempt.open(sock, deadline, target);
+      const line = await probeHttp(tunnel, deadline, request);
+      return { ok: true, protocol: attempt.protocol, ms: Date.now() - attemptStart, detail: line, text: tunnel.reader.lastText || "" };
     } catch (err) {
       attempts.push(attempt.protocol + ": " + (err && err.message ? err.message : String(err)));
     } finally {

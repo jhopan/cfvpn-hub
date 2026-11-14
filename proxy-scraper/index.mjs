@@ -18,11 +18,13 @@
 //   --flush N          tulis ke Supabase setiap N proxy hidup (default 100)
 //   --only-file FILE   pakai daftar ip:port dari file, jangan ambil sumber
 //   --dump FILE        tulis daftar kandidat tahap verifikasi
+//   --no-trace         lewati verifikasi TLS/jejak negara (bawaan: dijalankan)
 //   --dry-run          jangan tulis ke Supabase
 //   --verbose          cetak hasil tiap kandidat
 import { SOURCES, extractProxies } from "./sources.mjs";
 import { nodeConnect, tcpOpen } from "./node-socket.mjs";
 import { checkProxy } from "../cron-worker/src/proxy-check.mjs";
+import { tlsTrace } from "./tls-trace.mjs";
 import { readFileSync, writeFileSync } from "node:fs";
 
 const SUPABASE_URL = "https://lumbbmhhmkcnxunuryjr.supabase.co";
@@ -52,6 +54,7 @@ const OPT = {
   verbose: process.argv.includes("--verbose"),
   dump: arg("dump", null),
   onlyFile: arg("only-file", null),
+  noTrace: process.argv.includes("--no-trace"),
   dryRun: process.argv.includes("--dry-run"),
 };
 
@@ -138,13 +141,13 @@ async function persist(alive, byKey) {
       const res = await request(`${SUPABASE_URL}/rest/v1/proxy_pool?id=eq.${id}`, {
         method: "PATCH",
         headers: { ...HEADERS, Prefer: "return=minimal" },
-        body: JSON.stringify({ is_active: true, last_checked: now, ping: a.ms }),
+        body: JSON.stringify(Object.assign({ is_active: true, last_checked: now, ping: a.ms }, a.country ? { country: a.country } : {})),
       }, "patch " + a.proxy);
       if (res.status === 204) updated++;
     } else {
       // tandai lebih dulu supaya flush berikutnya tidak mencoba menyisipkan baris yang sama
       byKey.set(a.proxy, "inserted");
-      fresh.push({ ip: a.proxy.split(":")[0], port: a.proxy.split(":")[1], is_active: true, last_checked: now, ping: a.ms });
+      fresh.push({ ip: a.proxy.split(":")[0], port: a.proxy.split(":")[1], is_active: true, last_checked: now, ping: a.ms, country: a.country || null });
     }
   }
   let inserted = 0;
@@ -214,6 +217,9 @@ async function main() {
   let done = 0;
   let updated = 0;
   let inserted = 0;
+  let traceOk = 0;
+  let traceFail = 0;
+  let negaraDiperbarui = 0;
   let pendingFlush = [];
   let chain = Promise.resolve();
 
@@ -246,13 +252,27 @@ async function main() {
       probeTimeoutMs: OPT.probeTimeout,
     });
     done++;
-    const item = { proxy: p, ...res };
-    if (res.alive) {
+    // Tingkat-2: cek ringan hanya membuktikan port 80. Proxy yang memblokir/mengacak TLS 443
+    // tetap lolos di sana padahal worker memakainya untuk TLS. Sekaligus ambil negara keluar
+    // yang sebenarnya (loc= dari cdn-cgi/trace), bukan tebakan tabel IP.
+    let trace = null;
+    if (res.alive && !OPT.noTrace) {
+      trace = await tlsTrace(host, Number(port), { timeoutMs: OPT.sockTimeout });
+      if (trace.ok) {
+        traceOk++;
+        if (trace.country) negaraDiperbarui++;
+      } else {
+        traceFail++;
+      }
+    }
+    const item = { proxy: p, ...res, tlsMs: trace && trace.tlsMs, country: trace && trace.country, exitIp: trace && trace.exitIp };
+    const lulus = res.alive && (OPT.noTrace || (trace && trace.ok));
+    if (lulus) {
       alive.push(item);
       pendingFlush.push(item);
       if (pendingFlush.length >= OPT.flush) await flush();
     }
-    if (OPT.verbose) console.log(`  [${res.alive ? "HIDUP" : "mati "}] ${p.padEnd(24)} ${res.alive ? res.protocol + " " + res.ms + "ms" : res.detail}`);
+    if (OPT.verbose) console.log(`  [${lulus ? "PAKAI" : "buang"}] ${p.padEnd(24)} ${res.alive ? res.protocol + " " + res.ms + "ms" : res.detail}${trace ? " tls=" + (trace.ok ? trace.country + " " + trace.tlsMs + "ms" : "GAGAL " + trace.detail) : ""}`);
     else if (done % 500 === 0) console.log(`  ${done}/${toCheck.length} selesai, hidup: ${alive.length} (${((Date.now() - started) / 1000).toFixed(0)}s)`);
     return item;
   });
@@ -260,6 +280,7 @@ async function main() {
 
   alive.sort((a, b) => a.ms - b.ms);
   const byProtocol = alive.reduce((acc, a) => ((acc[a.protocol] = (acc[a.protocol] || 0) + 1), acc), {});
+  if (!OPT.noTrace) console.log(`TLS lewat tunnel: ${traceOk} lolos, ${traceFail} gagal (negara terisi: ${negaraDiperbarui})`);
   console.log(`\nHIDUP: ${alive.length} dari ${toCheck.length} (${JSON.stringify(byProtocol)})`);
   for (const a of alive.slice(0, 20)) console.log(`  ${a.proxy.padEnd(24)} ${String(a.protocol).padEnd(7)} ${a.ms}ms`);
   if (OPT.dryRun) console.log("\n--dry-run: tidak menulis ke Supabase");

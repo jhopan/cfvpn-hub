@@ -1,6 +1,5 @@
 ﻿import { createClient } from "@supabase/supabase-js";
 import { connect } from "cloudflare:sockets";
-import { checkProxy } from "./proxy-check.mjs";
 import { isMissingColumnError, probeTunnel } from "./tunnel.js";
 
 // Batas kerja satu siklus. `ctx.waitUntil` hanya diberi ~30 detik setelah respons, jadi
@@ -127,29 +126,23 @@ function errorText(err) {
 
 async function inspectProxy(supabase, row, connectFn, state, stats) {
   const port = Number(row.port);
-  // Berurutan, bukan paralel: cek dasar (proven cepat) menentukan apakah baris ini layak
-  // diprobe tunnel. Menjalankan keduanya bersamaan membuat Promise.all menunggu probe yang bisa
-  // menggantung pada proxy blackhole, sehingga baris yang cek dasarnya sudah selesai pun tidak
-  // pernah tercatat (terukur: 0 baris/siklus).
-  const check = await checkProxy(row.ip, port, connectFn, { timeoutMs: CHECK_TIMEOUT_MS }).catch(function (err) {
-    return { alive: false, protocol: null, ms: null, detail: errorText(err) };
+  // Probe tunnel = bukti nyata paket diteruskan proxy, jadi verdictnyalah yang menentukan
+  // `is_active` (dua arah). Kebijakan lama memakai cek ringan 5 detik sebagai penentu dan itu
+  // terbukti salah dua arah: 15 baris tembus tapi dimatikan, 7 baris aktif tapi terbukti mati.
+  // Sekali probe saja per baris, jadi siklus justru lebih cepat daripada sebelumnya.
+  const tunnel = await probeTunnel(row.ip, port, connectFn, { timeoutMs: TUNNEL_TIMEOUT_MS }).catch(function (err) {
+    return { ok: false, protocol: null, ms: null, detail: errorText(err) };
   });
-  const tunnel = check.alive
-    ? await probeTunnel(row.ip, port, connectFn, { timeoutMs: TUNNEL_TIMEOUT_MS }).catch(function (err) {
-      return { ok: false, protocol: null, ms: null, detail: errorText(err) };
-    })
-    : { ok: false, protocol: null, ms: null, detail: "cek dasar gagal, tunnel tidak diprobe" };
   const now = new Date().toISOString();
 
   stats.checked++;
   if (tunnel.ok) stats.tunnel++;
-  if (!check.alive) stats.disabled++;
+  if (!tunnel.ok) stats.disabled++;
   console.log("Proxy " + row.ip + ":" + row.port + " -> " +
-    (check.alive ? "HIDUP " + check.protocol + " " + check.ms + "ms" : "MATI (" + check.detail + ")") +
-    " | tunnel " + (tunnel.ok ? "TEMBUS " + tunnel.protocol + " " + tunnel.ms + "ms" : "GAGAL (" + tunnel.detail + ")"));
+    (tunnel.ok ? "TEMBUS " + tunnel.protocol + " " + tunnel.ms + "ms (" + tunnel.detail + ")" : "GAGAL (" + tunnel.detail + ")"));
 
-  const fields = check.alive
-    ? { last_checked: now, ping: check.ms }
+  const fields = tunnel.ok
+    ? { is_active: true, last_checked: now, ping: tunnel.ms }
     : { is_active: false, last_checked: now, ping: null };
   const tunnelFields = { tunnel_ok: tunnel.ok, tunnel_ms: tunnel.ok ? tunnel.ms : null, tunnel_checked: now };
   await patchProxy(supabase, row.id, fields, tunnelFields, state);
@@ -184,9 +177,8 @@ export default {
       // Batch kecil: tiap proxy diuji dengan handshake nyata (SOCKS5/HTTP CONNECT + satu
       // request HTTP), jadi tidak mungkin memeriksa ribuan baris dalam satu run.
       //
-      // Peran worker ini HANYA menjaga pool yang sudah aktif (menandai `is_active = false`
-      // kalau proxy benar-benar tidak meneruskan permintaan). Worker ini TIDAK PERNAH
-      // menyalakan proxy:
+      // Worker ini menjaga pool berdasarkan probe tunnel (boleh mematikan DAN menghidupkan kembali
+      // kalau proxy benar-benar tidak meneruskan permintaan).
       //   - cek dangkal di sini bisa lolos di proxy yang tidak sanggup TLS, sedangkan panel
       //     memakai proxy untuk WebSocket VLESS di 443 → hasilnya konfigurasi mati;
       //   - timeout 5 detik terlalu ketat untuk proxy publik sehat (terukur 7-12 detik),

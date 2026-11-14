@@ -189,8 +189,19 @@ sql/2026-11-14-proxy-tunnel-columns.sql
 
 Sebelum SQL dijalankan cron tetap jalan (hanya menulis kolom lama, satu peringatan per siklus).
 Yang ditulis: `tunnel_ok` (`null` = belum pernah diperiksa, `false` = terbukti gagal), `tunnel_ms`,
-`tunnel_checked`. Worker memakai `tunnel_ok` sebagai urutan pertama saat memilih proxy dari pool,
+`tunnel_checked`, dan `ping` (kini = waktu tunnel). **Verdict probe tunnel yang menentukan
+`is_active`**: baris yang benar-benar tembus dinyalakan, yang gagal dimatikan. Sebelumnya penentu
+adalah cek ringan 5 detik, dan itu salah dua arah — terukur 15 baris terbukti tembus justru
+dimatikan, 7 baris aktif tapi terbukti mati.
+Worker memakai `tunnel_ok` sebagai urutan pertama saat memilih proxy dari pool,
 dan halaman Generator menandai baris terverifikasi dengan ✓.
+
+Scraper (`proxy-scraper/`) melakukan verifikasi **dua tingkat**: handshake + `GET 204` di port 80,
+lalu **TLS 443 lewat tunnel** (`tls-trace.mjs`) sekaligus mengambil **negara keluar** dari
+`cdn-cgi/trace`. Hanya baris yang lulus TLS yang dipromosikan, jadi proxy yang memblokir atau
+mengacak TLS tidak lagi masuk pool. Jalankan berkala (mis.
+`node proxy-scraper/index.mjs --cap 3000`) supaya stok tidak menipis; `--no-trace` melewati
+pemeriksaan TLS.
 
 ### Keamanan: auth server-side & rate limit
 
