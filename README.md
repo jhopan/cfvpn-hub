@@ -178,6 +178,33 @@ npx wrangler deploy
 
 Set env vars di `cron-worker/wrangler.toml` atau Cloudflare dashboard.
 
+### Verifikasi tunnel & kolom baru
+
+Cron worker menembus setiap proxy secara nyata (HTTP CONNECT lalu SOCKS5 ke `example.com:80`) dan
+menyimpan hasilnya di kolom baru. Jalankan dulu berkas ini di Supabase SQL Editor:
+
+```
+sql/2026-11-14-proxy-tunnel-columns.sql
+```
+
+Sebelum SQL dijalankan cron tetap jalan (hanya menulis kolom lama, satu peringatan per siklus).
+Yang ditulis: `tunnel_ok` (`null` = belum pernah diperiksa, `false` = terbukti gagal), `tunnel_ms`,
+`tunnel_checked`. Worker memakai `tunnel_ok` sebagai urutan pertama saat memilih proxy dari pool,
+dan halaman Generator menandai baris terverifikasi dengan ✓.
+
+### Keamanan: auth server-side & rate limit
+
+1. **Deploy panel dulu**, baru jalankan `sql/2026-11-14-auth-hardening.sql` di Supabase SQL Editor.
+   Setelah itu kolom hash sandi tidak bisa dibaca dengan anon key dan pembuatan/pengubahan admin
+   diverifikasi server (RPC `verify_login`, `register_user`, `admin_action`). Panel tetap bisa
+   login sebelum SQL dijalankan karena jalur lama dipakai otomatis.
+2. `POST /api/cf` punya rate limit per IP (bawaan 10 permintaan / 600 detik). Atur lewat env
+   `RATE_LIMIT` dan `RATE_WINDOW_SEC`. Batas ini per-colo dan best-effort, bukan kuota global.
+3. Gerbang Origin opsional: isi env `ALLOWED_ORIGINS` (mis. `https://cfvpn-hub-9xy.pages.dev`,
+   boleh pola `*.domain`) untuk menolak pemanggilan dari origin lain. Kosong = seperti sebelumnya.
+4. Worker VPN bisa menutup `/health` dengan binding `HEALTH_TOKEN` (`?token=` atau header
+   `x-health-token`); badge versi worker di dasbor berhenti bekerja kalau ini diaktifkan.
+
 ## Role System
 
 | Role | Akses |
@@ -213,7 +240,9 @@ berlaku di atas pilihan itu.
 Kalau memakai filter negara, worker **gagal-tertutup**: saat negara itu sedang tidak punya proxy
 sehat, koneksi ditutup — bukan diam-diam keluar lewat proxy negara lain. Longgarkan dengan
 beberapa negara (`/ID,SG`) atau pakai `/ALL` kalau negara keluar tidak penting. Halaman **Generator** punya centang **"Mode rotasi"**: filter negara
-yang dipilih otomatis menjadi path (`/ID`, atau `/ALL` kalau tanpa filter).
+yang dipilih otomatis menjadi path (`/ID`, `/ID,SG`, atau `/ALL` kalau tanpa filter). Daftar negara
+bisa dipilih lebih dari satu (Ctrl/Cmd) dan tiap pilihan menampilkan jumlah proxy segar; kalau
+tidak ada satu pun proxy siap pakai, Generator memberi peringatan sebelum config dibuat.
 
 ## Relay UDP di Halaman Deploy
 

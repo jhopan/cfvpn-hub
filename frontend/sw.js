@@ -1,5 +1,5 @@
 // CFVPN Hub Service Worker - cache static assets for offline use
-const CACHE_NAME = "cfvpn-hub-v10";
+const CACHE_NAME = "cfvpn-hub-v11";
 const ASSETS = [
   "/",
   "/index.html",
@@ -37,6 +37,22 @@ self.addEventListener("fetch", (event) => {
 
   // Network-first for navigation (HTML)
   if (event.request.mode === "navigate" || event.request.destination === "script" || event.request.destination === "style") {
+    event.respondWith(
+      fetch(event.request)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          return res;
+        })
+        .catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
+  // Template Worker (/source/*.js) diambil app.js lewat fetch(), jadi destination-nya kosong dan
+  // tanpa aturan ini ia jatuh ke cache-first: template basi ikut ter-upload saat deploy. Pakai
+  // network-first (salinan cache tetap disimpan untuk cadangan offline).
+  if (url.pathname.startsWith("/source/")) {
     event.respondWith(
       fetch(event.request)
         .then((res) => {

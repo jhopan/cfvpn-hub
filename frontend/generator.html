@@ -70,14 +70,20 @@
 
             <label class="field" style="flex-direction: row; align-items: center; gap: 8px;">
               <input id="rotateMode" type="checkbox" style="width: auto;">
-              <span>Mode rotasi — worker pilih proxy sendiri (path <code>/rotate</code>), satu config
-              yang tidak perlu diganti saat pool berubah</span>
+              <span>Mode rotasi — worker pilih proxy sendiri (path <code>/ALL</code>, atau
+              <code>/ID,SG</code> sesuai filter negara), satu config yang tidak perlu diganti saat
+              pool berubah</span>
             </label>
 
             <div class="fields-row">
-              <label class="field"><span>Filter negara</span><select id="countrySelect"><option value="">Semua negara</option></select></label>
+              <label class="field">
+                <span>Filter negara <em>(kosong = semua, Ctrl/Cmd untuk pilih lebih dari satu)</em></span>
+                <select id="countrySelect" multiple size="4"></select>
+              </label>
               <label class="field"><span>Filter penyedia</span><select id="orgSelect"><option value="">Semua penyedia</option></select></label>
             </div>
+
+            <p class="form-message" id="countryStats" aria-live="polite"></p>
 
             <label class="field">
               <span>Proxy spesifik (opsional)</span>

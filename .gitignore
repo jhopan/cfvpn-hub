@@ -15,3 +15,5 @@ __pycache__/
 .vless-url.txt
 .test-candidates.sh
 vless-id.yaml
+# artefak uji xray yang pernah ikut ter-commit (berisi UUID hidup)
+test-xray-vless.json

@@ -78,8 +78,9 @@ async function generateLocalConfigs(params) {
     const uuid = bound ? bound.uuid : crypto.randomUUID();
     const port = params.portList[0] || "443";
     const tls = port === "443";
-    // Filter negara yang dipilih dipakai sebagai selector path: /ID, /ID,SG, atau /ALL.
-    const country = (params.ccList && params.ccList[0]) || "";
+    // Semua negara terpilih menjadi selector path: /ID, /ID,SG, atau /ALL kalau kosong.
+    const countryList = (params.ccList || []).map((cc) => String(cc).trim().toUpperCase()).filter((cc) => /^[A-Z]{2}$/.test(cc));
+    const country = [...new Set(countryList)].join(",");
     const path = country ? "/" + country : "/ALL";
     const query = new URLSearchParams({
       encryption: "none", type: "ws", host: params.host,
@@ -302,7 +303,7 @@ function renderDashboard() {
       const el = $("statTotalUsers");
       if (!el) return;
       try {
-        const { count } = await supabase.from("users_custom").select("*", { count: "exact", head: true });
+        const { count } = await supabase.from("users_custom").select("username", { count: "exact", head: true });
         el.textContent = count ?? 0;
       } catch { el.textContent = "0"; }
     })();
@@ -476,24 +477,62 @@ async function loadProxyPickerData() {
   const CACHE_TTL = 6 * 60 * 60 * 1000;
   try {
     const cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
-    if (cached && (Date.now() - cached.ts) < CACHE_TTL) {
+    if (cached && cached.v === 2 && (Date.now() - cached.ts) < CACHE_TTL) {
       _proxyPickerCache = cached.data;
       return _proxyPickerCache;
     }
   } catch {}
   let proxies = [];
   if (supabase) {
-    const { data } = await supabase.from("proxy_pool").select("ip,port,country,org").eq("is_active", true);
-    if (data && data.length) {
-      proxies = data.map(p => ({ ip: p.ip, port: String(p.port), country: p.country || "", org: p.org || "" }));
+    // `last_checked` dipakai untuk tahu baris mana yang masih segar (worker hanya memakai baris
+    // < 6 jam), sedangkan `tunnel_ok`/`tunnel_ms` diisi cron-worker dari probe tunnel nyata.
+    // Kolom tunnel bisa belum ada (butuh SQL), jadi kalau PostgREST menolaknya panel tetap jalan
+    // dengan proyeksi lama.
+    const base = "ip,port,country,org,last_checked,ping";
+    const { data, error } = await supabase.from("proxy_pool").select(base + ",tunnel_ok,tunnel_ms").eq("is_active", true);
+    let rows = data;
+    if (error) ({
+      data: rows,
+    } = await supabase.from("proxy_pool").select(base).eq("is_active", true));
+    if (rows && rows.length) {
+      proxies = rows.map((p) => ({
+        ip: p.ip,
+        port: String(p.port),
+        country: p.country || "",
+        org: p.org || "",
+        checked: p.last_checked || "",
+        ping: Number(p.ping) || 0,
+        tunnel: typeof p.tunnel_ok === "boolean" ? p.tunnel_ok : null,
+        tunnelMs: Number(p.tunnel_ms) || 0,
+      }));
     }
   }
   // No local fallback — only use Supabase
   if (!proxies.length) return [];
   proxies = proxies.map(p => ({ ...p, country: p.country || "??", org: p.org || "Unknown" }));
   _proxyPickerCache = proxies;
-  localStorage.setItem(CACHE_KEY, JSON.stringify({ data: proxies, ts: Date.now() }));
+  localStorage.setItem(CACHE_KEY, JSON.stringify({ v: 2, data: proxies, ts: Date.now() }));
   return proxies;
+}
+
+// Sehat = cron baru mengecek (< 6 jam, sama seperti filter pool di worker) dan tidak pernah
+// dinyatakan mati oleh probe tunnel. `null` berarti belum pernah diprobe, bukan mati.
+const PROXY_FRESH_MS = 6 * 60 * 60 * 1000;
+function proxyHealth(list, countries) {
+  const now = Date.now();
+  const wanted = (countries || []).filter(Boolean);
+  const scope = wanted.length ? list.filter((p) => wanted.includes(p.country)) : list;
+  const fresh = scope.filter((p) => {
+    const t = Date.parse(p.checked || "");
+    return Number.isFinite(t) && (now - t) < PROXY_FRESH_MS;
+  });
+  return {
+    total: scope.length,
+    fresh: fresh.length,
+    verified: fresh.filter((p) => p.tunnel === true).length,
+    knownDead: fresh.filter((p) => p.tunnel === false).length,
+    usable: fresh.filter((p) => p.tunnel !== false),
+  };
 }
 
 function renderGenerator() {
@@ -514,24 +553,49 @@ function renderGenerator() {
   const orgSelect = $("orgSelect");
   const proxySelect = $("proxySelect");
 
+  // Multi-pilih: tidak ada opsi "semua negara" — tidak memilih apa pun berarti semua negara.
+  const selectedCountries = () => [...countrySelect.selectedOptions].map(o => o.value).filter(Boolean);
   const populateCountries = () => {
     const countries = [...new Set(allProxies.map(p => p.country))].filter(c => c && c !== "??").sort();
-    countrySelect.innerHTML = `<option value="">Semua negara</option>` + countries.map(c => `<option value="${c}">${getFlagEmoji(c)} ${c}</option>`).join("");
+    countrySelect.innerHTML = countries.map(c => {
+      const fresh = proxyHealth(allProxies, [c]).fresh;
+      return `<option value="${c}">${getFlagEmoji(c)} ${c} · ${fresh} segar</option>`;
+    }).join("");
+  };
+  const updateCountryStats = () => {
+    const el = $("countryStats");
+    if (!el) return;
+    const cc = selectedCountries();
+    if (!cc.length) {
+      const all = proxyHealth(allProxies, []);
+      el.textContent = `${all.fresh} proxy segar di semua negara (${all.usable.length} siap dipakai).`;
+      el.classList.remove("error");
+      return;
+    }
+    const h = proxyHealth(allProxies, cc);
+    const flag = cc.map(c => `${getFlagEmoji(c)} ${c}`).join(" + ");
+    const parts = [`${flag}: ${h.fresh} dari ${h.total} proxy masih segar`];
+    if (h.verified) parts.push(`${h.verified} terverifikasi tunnel`);
+    else if (h.knownDead) parts.push(`${h.knownDead} terbukti mati`);
+    else parts.push("belum ada yang terverifikasi tunnel");
+    let text = parts.join(" · ");
+    if (!h.usable.length) text += " — kemungkinan gagal: tidak ada proxy siap pakai, pakai /ALL atau negara lain.";
+    el.textContent = text;
+    el.classList.toggle("error", h.usable.length === 0);
   };
   const populateOrgs = () => {
-    const cc = countrySelect.value;
-    const filtered = cc ? allProxies.filter(p => p.country === cc) : allProxies;
-    const orgs = [...new Set(filtered.map(p => p.org))].sort();
+    const cc = selectedCountries();
+    const scope = cc.length ? allProxies.filter(p => cc.includes(p.country)) : allProxies;
+    const orgs = [...new Set(scope.map(p => p.org))].sort();
     orgSelect.innerHTML = `<option value="">Semua penyedia</option>` + orgs.map(o => `<option value="${escapeHtml(o)}">${escapeHtml(o)}</option>`).join("");
   };
   const populateProxies = () => {
-    const cc = countrySelect.value;
+    const cc = selectedCountries();
     const org = orgSelect.value;
-    let filtered = allProxies;
-    if (cc) filtered = filtered.filter(p => p.country === cc);
-    if (org) filtered = filtered.filter(p => p.org === org);
-    proxySelect.innerHTML = `<option value="">Acak (${filtered.length} proxy)</option>` + filtered.slice(0, 200).map(p => {
-      return `<option value="${p.ip}:${p.port}">${getFlagEmoji(p.country)} ${p.ip}:${p.port} · ${escapeHtml(p.org)}</option>`;
+    const usable = proxyHealth(allProxies, cc).usable;
+    const filtered = org ? usable.filter(p => p.org === org) : usable;
+    proxySelect.innerHTML = `<option value="">Acak (${filtered.length} proxy siap pakai)</option>` + filtered.slice(0, 200).map(p => {
+      return `<option value="${p.ip}:${p.port}">${getFlagEmoji(p.country)} ${p.ip}:${p.port} · ${escapeHtml(p.org)}${p.tunnel === true ? " ✓" : ""}</option>`;
     }).join("");
   };
 
@@ -542,6 +606,7 @@ function renderGenerator() {
       populateCountries();
       populateOrgs();
       populateProxies();
+      updateCountryStats();
       setMessage("formMessage", `${allProxies.length} proxy aktif tersedia.`);
     } catch (e) {
       setMessage("formMessage", "Gagal memuat proxy: " + e.message, true);
@@ -558,7 +623,8 @@ function renderGenerator() {
     updatePreview();
   };
 
-  countrySelect.onchange = () => { populateOrgs(); populateProxies(); updatePreview(); };
+  countrySelect.onchange = () => { populateOrgs(); populateProxies(); updateCountryStats(); updatePreview(); };
+  $("rotateMode")?.addEventListener("change", () => updatePreview());
   orgSelect.onchange = () => { populateProxies(); updatePreview(); };
   proxySelect.onchange = () => updatePreview();
   lbSelect.onchange = () => updatePreview();
@@ -586,15 +652,17 @@ function renderGenerator() {
       $("subUrlPreview").hidden = true;
       const worker = selectedWorker();
       if (!worker) { $("urlPreview").textContent = "Pilih VPN Worker aktif dulu."; return; }
-      const cc = countrySelect.value;
+      const cc = selectedCountries();
       const org = orgSelect.value;
       const specific = proxySelect.value;
       const lim = $("limitInput").value;
+      const rotate = $("rotateMode")?.checked === true;
       let info = `${worker.host} · ${lim} config`;
       if (specific) info += ` · ${specific}`;
-      else if (cc) info += ` · ${getFlagEmoji(cc)} ${cc}`;
+      else if (cc.length) info += ` · ${cc.map(c => `${getFlagEmoji(c)} ${c}`).join("+")}`;
       else info += ` · semua negara`;
       if (org) info += ` · ${org}`;
+      if (rotate) info += ` · path ${cc.length ? "/" + cc.join(",") : "/ALL"}`;
       $("urlPreview").textContent = info;
     }
   };
@@ -639,7 +707,7 @@ function renderGenerator() {
       } else {
         const worker = selectedWorker();
         if (!worker) return setMessage("formMessage", "Pilih VPN Worker aktif dulu.", true);
-        const ccValue = countrySelect.value;
+        const ccList = selectedCountries();
         const orgValue = orgSelect.value;
         const rotate = $("rotateMode")?.checked === true;
         const specificProxy = proxySelect.value;
@@ -648,12 +716,12 @@ function renderGenerator() {
           if (specificProxy) {
             customProxyList = [specificProxy];
           } else {
-            let filtered = allProxies;
-            if (ccValue) filtered = filtered.filter(p => p.country === ccValue);
-            if (orgValue) filtered = filtered.filter(p => p.org === orgValue);
-            customProxyList = filtered.map(p => p.ip + ":" + p.port);
+            // Hanya baris segar (< 6 jam) dan yang belum dinyatakan mati oleh probe tunnel;
+            // proxy basi berarti config yang tidak akan tersambung.
+            const usable = proxyHealth(allProxies, ccList).usable;
+            customProxyList = (orgValue ? usable.filter(p => p.org === orgValue) : usable).map(p => p.ip + ":" + p.port);
           }
-          if (!customProxyList.length) throw new Error("Tidak ada proxy aktif untuk filter ini.");
+          if (!customProxyList.length) throw new Error("Tidak ada proxy segar untuk filter ini.");
         }
         const params = {
           host: worker.host,
@@ -662,7 +730,7 @@ function renderGenerator() {
           portList: [$("portSelect").value],
           format: $("formatSelect").value,
           limit: Number($("limitInput").value),
-          ccList: ccValue ? [ccValue] : [],
+          ccList,
           customProxyList,
           rotate,
         };
@@ -891,6 +959,28 @@ async function hashPassword(password) {
   return [...new Uint8Array(hash)].map((item) => item.toString(16).padStart(2, "0")).join(""); 
 }
 
+// ---- Auth lewat RPC: sql/2026-11-14-auth-hardening.sql -------------------------------
+// Setelah SQL itu dijalankan, kolom password_hash tidak lagi bisa dibaca dengan anon key dan
+// tidak ada izin tulis mentah ke users_custom, jadi login/daftar/aksi admin lewat fungsi
+// SECURITY DEFINER. Semua jalur memakai fallback ke cara lama saat fungsinya belum ada, supaya
+// panel tetap bekerja sebelum maupun sesudah SQL dijalankan.
+function rpcMissing(error) {
+  if (!error) return false;
+  const code = String(error.code || "");
+  const message = String(error.message || "");
+  return code === "PGRST202" || code === "404" || /could not find the function|does not exist/i.test(message);
+}
+function rpcErrorMessage(error) {
+  return String((error && error.message) || "tidak diketahui");
+}
+// Sesi menyimpan hash sandi (bukan sandinya) karena aksi admin diverifikasi server dengan hash itu.
+function saveSession(user, hash) {
+  const session = { username: user.username, role: user.role || "user" };
+  if (hash) session.hash = hash;
+  localStorage.setItem(sessionKey, JSON.stringify(session));
+  return session;
+}
+
 function renderAuth() {
   const tabLogin = $("tabLogin");
   const tabRegister = $("tabRegister");
@@ -927,17 +1017,24 @@ function renderAuth() {
     const passwordHash = await hashPassword(password);
 
     if (supabase) {
-      // 1. Cek apakah username sudah ada pakai maybeSingle() agar tidak error jika kosong
+      // Server yang membuat akun beserta hash-nya; klien tidak mengirim/membaca password_hash.
+      const viaRpc = await supabase.rpc("register_user", { p_username: username, p_password: password });
+      if (!viaRpc.error) {
+        if (viaRpc.data === false) return setMessage("registerMessage", "Username sudah terdaftar.", true);
+        saveSession({ username, role: "user" }, passwordHash);
+        location.href = "index.html";
+        return;
+      }
+      if (!rpcMissing(viaRpc.error)) return setMessage("registerMessage", "Gagal buat akun: " + rpcErrorMessage(viaRpc.error), true);
+
+      // Jalur lama (SQL auth belum dijalankan)
       const { data: existingUser, error: checkError } = await supabase.from('users_custom').select('username, role').eq('username', username).maybeSingle();
       if (checkError) return setMessage("registerMessage", "Error cek DB: " + checkError.message, true);
       if (existingUser) return setMessage("registerMessage", "Username sudah terdaftar.", true);
-
-      // 2. Insert user baru
-      const { error: insertError } = await supabase.from('users_custom').insert([{ username, password_hash: passwordHash }]);
+      const { error: insertError } = await supabase.from('users_custom').insert([{ username, password_hash: passwordHash }]).select("username, role");
       if (insertError) return setMessage("registerMessage", "Gagal buat akun: " + insertError.message, true);
-      
-      // 3. Auto Login
-      localStorage.setItem(sessionKey, JSON.stringify({ username, role: "user" }));
+
+      saveSession({ username, role: "user" }, passwordHash);
       location.href = "index.html";
       return;
     }
@@ -958,16 +1055,26 @@ function renderAuth() {
     const passwordHash = await hashPassword(password);
 
     if (supabase) {
+      // Server yang membandingkan hash, jadi kolom password_hash tidak perlu dibaca klien.
+      const viaRpc = await supabase.rpc("verify_login", { p_username: username, p_password: password });
+      if (!viaRpc.error) {
+        const row = Array.isArray(viaRpc.data) ? viaRpc.data[0] : viaRpc.data;
+        if (!row || !row.username) return setMessage("loginMessage", "Username atau sandi salah.", true);
+        saveSession({ username: row.username, role: row.role || "user" }, passwordHash);
+        location.href = "index.html";
+        return;
+      }
+      if (!rpcMissing(viaRpc.error)) return setMessage("loginMessage", "Error DB: " + rpcErrorMessage(viaRpc.error), true);
+
+      // Jalur lama (SQL auth belum dijalankan)
       const { data: user, error } = await supabase.from('users_custom')
         .select('username, role')
         .eq('username', username)
         .eq('password_hash', passwordHash)
         .maybeSingle();
-        
       if (error) return setMessage("loginMessage", "Error DB: " + error.message, true);
       if (!user) return setMessage("loginMessage", "Username atau sandi salah.", true);
-      
-      localStorage.setItem(sessionKey, JSON.stringify({ username: user.username, role: user.role || "user" }));
+      saveSession({ username: user.username, role: user.role || "user" }, passwordHash);
       location.href = "index.html";
       return;
     }
@@ -992,11 +1099,11 @@ function renderAdmin() {
   const loadStats = async () => {
     if (!supabase) return;
     try {
-      const { count: total } = await supabase.from("users_custom").select("*", { count: "exact", head: true });
+      const { count: total } = await supabase.from("users_custom").select("username", { count: "exact", head: true });
       document.getElementById("statTotalUsers").textContent = total ?? 0;
-      const { count: admins } = await supabase.from("users_custom").select("*", { count: "exact", head: true }).eq("role", "admin");
+      const { count: admins } = await supabase.from("users_custom").select("username", { count: "exact", head: true }).eq("role", "admin");
       document.getElementById("statAdmins").textContent = admins ?? 0;
-      const { count: regular } = await supabase.from("users_custom").select("*", { count: "exact", head: true }).eq("role", "user");
+      const { count: regular } = await supabase.from("users_custom").select("username", { count: "exact", head: true }).eq("role", "user");
       document.getElementById("statRegularUsers").textContent = regular ?? 0;
     } catch {}
   };
@@ -1043,8 +1150,15 @@ function renderAdmin() {
       if (!confirm(`Ubah ${username} → ${newRole}?`)) return;
       toggleBtn.disabled = true;
       try {
-        const { error } = await supabase.from("users_custom").update({ role: newRole }).eq("username", username);
-        if (error) throw error;
+        const viaRpc = await supabase.rpc("admin_action", {
+          p_actor: currentUser?.username || "", p_actor_hash: currentUser?.hash || "",
+          p_action: "set_role", p_target: username, p_role: newRole,
+        });
+        if (viaRpc.error) {
+          if (!rpcMissing(viaRpc.error)) throw viaRpc.error;
+          const { error } = await supabase.from("users_custom").update({ role: newRole }).eq("username", username);
+          if (error) throw error;
+        }
         setMessage("userMessage", `${username} → ${newRole}.`);
         loadUsers();
         loadStats();
@@ -1060,8 +1174,15 @@ function renderAdmin() {
       if (!confirm(`Hapus user ${username} permanen?`)) return;
       delBtn.disabled = true;
       try {
-        const { error } = await supabase.from("users_custom").delete().eq("username", username);
-        if (error) throw error;
+        const viaRpc = await supabase.rpc("admin_action", {
+          p_actor: currentUser?.username || "", p_actor_hash: currentUser?.hash || "",
+          p_action: "delete", p_target: username,
+        });
+        if (viaRpc.error) {
+          if (!rpcMissing(viaRpc.error)) throw viaRpc.error;
+          const { error } = await supabase.from("users_custom").delete().eq("username", username);
+          if (error) throw error;
+        }
         setMessage("userMessage", `${username} dihapus.`);
         loadUsers();
         loadStats();
@@ -1083,11 +1204,19 @@ function renderAdmin() {
     btn.disabled = true;
     btn.textContent = "Menyimpan...";
     try {
-      const passwordHash = await hashPassword(password);
-      const { data: existing } = await supabase.from("users_custom").select("username").eq("username", username).maybeSingle();
-      if (existing) { setMessage("addAdminMessage", "Username sudah ada.", true); return; }
-      const { error } = await supabase.from("users_custom").insert([{ username, password_hash: passwordHash, role: "admin" }]);
-      if (error) throw error;
+      const viaRpc = await supabase.rpc("admin_action", {
+        p_actor: currentUser?.username || "", p_actor_hash: currentUser?.hash || "",
+        p_action: "create", p_target: username, p_role: "admin", p_password: password,
+      });
+      if (!viaRpc.error && viaRpc.data === false) { setMessage("addAdminMessage", "Username sudah ada.", true); return; }
+      if (viaRpc.error) {
+        if (!rpcMissing(viaRpc.error)) throw viaRpc.error;
+        const passwordHash = await hashPassword(password);
+        const { data: existing } = await supabase.from("users_custom").select("username").eq("username", username).maybeSingle();
+        if (existing) { setMessage("addAdminMessage", "Username sudah ada.", true); return; }
+        const { error } = await supabase.from("users_custom").insert([{ username, password_hash: passwordHash, role: "admin" }]).select("username, role");
+        if (error) throw error;
+      }
       setMessage("addAdminMessage", `Admin ${username} dibuat.`);
       document.getElementById("newAdminUsername").value = "";
       document.getElementById("newAdminPassword").value = "";
