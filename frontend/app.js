@@ -26,27 +26,35 @@ function shuffleArray(items) {
     [items[i], items[j]] = [items[j], items[i]];
   }
   return items;
-}function generateClashYaml(configs) {
-  const proxies = configs.map((c, i) => {
+}
+
+function generateClashYaml(configs) {
+  const proxies = configs.map((c) => {
     const u = new URL(c);
-    if (u.protocol === "vless:") {
-      return `  - name: "${decodeURIComponent(u.hash.slice(1))}"
-    type: vless
-    server: ${u.hostname}
-    port: ${u.port}
-    uuid: ${u.username}
-    udp: true
-    tls: ${u.searchParams.get("security") === "tls"}
-    network: ws
-    servername: ${u.searchParams.get("sni") || u.hostname}
-    ws-opts:
-      path: "${u.searchParams.get("path") || "/"}"
-      headers:
-        Host: ${u.searchParams.get("host") || u.hostname}`;
-    }
-    return ""; // Simplified: Add trojan/ss mapping if needed
+    if (u.protocol !== "vless:") return ""; // Simplified: trojan/ss mapping belum ada
+    // Baris dirakit sebagai daftar supaya tidak ada string multi-baris (dulu sempat merusak
+    // seluruh file dengan SyntaxError saat menambah skip-cert-verify).
+    const lines = [
+      `  - name: "${decodeURIComponent(u.hash.slice(1))}"`,
+      "    type: vless",
+      `    server: ${u.hostname}`,
+      `    port: ${u.port}`,
+      `    uuid: ${u.username}`,
+      "    udp: true",
+      `    tls: ${u.searchParams.get("security") === "tls"}`,
+    ];
+    if (u.searchParams.get("allowInsecure") === "1") lines.push("    skip-cert-verify: true");
+    lines.push(
+      "    network: ws",
+      `    servername: ${u.searchParams.get("sni") || u.hostname}`,
+      "    ws-opts:",
+      `      path: "${u.searchParams.get("path") || "/"}"`,
+      "      headers:",
+      `        Host: ${u.searchParams.get("host") || u.hostname}`,
+    );
+    return lines.join("\n");
   }).filter(Boolean).join("\n");
-  
+
   return `proxies:\n${proxies}`;
 }
 
@@ -60,7 +68,7 @@ function generateSingboxJson(configs) {
         server: u.hostname,
         server_port: parseInt(u.port),
         uuid: u.username,
-        tls: u.searchParams.get("security") === "tls" ? { enabled: true, server_name: u.searchParams.get("sni") || u.hostname, insecure: false } : undefined,
+        tls: u.searchParams.get("security") === "tls" ? { enabled: true, server_name: u.searchParams.get("sni") || u.hostname, insecure: u.searchParams.get("allowInsecure") === "1" } : undefined,
         transport: { type: "ws", path: u.searchParams.get("path") || "/", headers: { Host: u.searchParams.get("host") || u.hostname } }
       };
     }
@@ -88,6 +96,7 @@ async function generateLocalConfigs(params) {
       security: tls ? "tls" : "none", path,
     });
     if (tls) query.set("sni", params.host);
+    if (tls && params.insecure) query.set("allowInsecure", "1");
     const label = `1 CFVPN WS ${tls ? "TLS" : "NTLS"} [${country || "ALL"}] [${params.serviceName}]`;
     return formatConfigs([`vless://${uuid}@${params.host}:${port}?${query}#${encodeURIComponent(label)}`], params.format);
   }
@@ -148,6 +157,7 @@ async function generateLocalConfigs(params) {
       
       const query = new URLSearchParams({ encryption: "none", type: "ws", host: params.host, security: tls ? "tls" : "none", path });
       if (tls) query.set("sni", params.host);
+      if (tls && params.insecure) query.set("allowInsecure", "1");
       const config = `vless://${uuid}@${params.host}:${port}?${query}#${encodeURIComponent(label)}`;
       configs.push(config);
     }
@@ -781,6 +791,7 @@ function renderGenerator() {
           ccList,
           customProxyList,
           rotate,
+          insecure: $("insecureTls")?.checked === true,
         };
         const content = await generateLocalConfigs(params);
         $("resultText").value = content;

@@ -211,7 +211,13 @@ Project lama `cgflrpjavyotvolnvcnl` (anon-key-only, bukan milik akun ini) tidak 
 
 1. **No secrets in the frontend.** Cloudflare API keys and Supabase credentials belong only in `functions/` (server-side) or `.env` (local, gitignored).
 2. `app.js` is an ES module: no import statement outside the module, and **no BOM** (a BOM crashes it with `SyntaxError: Unexpected token '}'`).
-3. After editing `app.js`, `node --check frontend/app.js` must pass.
+3. After editing `app.js`, **dua** gate: `node --check frontend/app.js` **dan** uji parse sebagai modul:
+
+   ```bash
+   node --no-warnings --input-type=module -e "await import('file:///C:/Users/ACER/documents/Project/cfvpn-hub/frontend/app.js')"
+   ```
+
+   Hasil yang benar = error **runtime** (mis. `Only URLs with a scheme in: file and data are supported` karena import CDN), **bukan** `SyntaxError`. Ini wajib: 2026-11-14 satu edit string multi-baris di `generateClashYaml` lolos `node --check` tetapi membuat browser menolak seluruh `app.js` (`SyntaxError: Invalid or unexpected token`) sehingga panel mati tanpa gejala lain (handler tidak terpasang, pesan kosong).
 4. `sw.js` cache busting: raise `CACHE_NAME` whenever an asset changes, otherwise users keep the old version.
 5. Role check: `currentUser?.role !== "admin"` → **hide** admin features, do not merely disable them.
 6. Protected pages must check the session before rendering; if `visibility:hidden` is used, JS must reveal it or the screen stays black.

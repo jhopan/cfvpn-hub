@@ -67,6 +67,13 @@
             pakai ini kalau klien menolak dengan <code>Trust anchor for certification path not found</code>.
             Port 443 lebih privat — pilih itu kalau perangkatmu sudah punya CA modern.</p>
 
+            <label class="field" style="flex-direction: row; align-items: center; gap: 8px;">
+              <input id="insecureTls" type="checkbox" style="width: auto;">
+              <span>Lewati verifikasi sertifikat (<code>allowInsecure</code>) — hanya untuk port 443 dan
+              hanya kalau klien menolak dengan "trust anchor". Ini mematikan perlindungan MITM pada
+              tunnel, jadi pakai hanya sebagai jalan terakhir.</span>
+            </label>
+
             <div class="fields-row">
               <label class="field"><span>Format output</span><select id="formatSelect"><option value="raw">Raw (VLESS URI)</option><option value="v2ray">V2Ray (Base64)</option><option value="clash">Clash (YAML)</option><option value="sfa">Sing-box (JSON)</option></select></label>
               <label class="field"><span>Jumlah config</span><input id="limitInput" type="number" min="1" max="100" value="1" required></label>
