@@ -4,7 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "wrangler pages dev frontend --compatibility-date=2024-05-12",
-    "deploy": "wrangler pages deploy frontend"
+    "deploy": "wrangler pages deploy frontend",
+    "sync-templates": "node scripts/sync-templates.mjs",
+    "check:templates": "node scripts/sync-templates.mjs --check",
+    "test": "node --test \"tests/*.test.mjs\""
   },
   "devDependencies": {
     "playwright": "^1.62.1",

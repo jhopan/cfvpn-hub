@@ -60,6 +60,17 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const POOL_CACHE_MAX = 8;
 const poolCache = new Map();
 const poolFetching = new Map();
+// Urutan pool: proxy yang terbukti bisa dibuat tunnel dulu (tunnel_ok true -> null/belum
+// diprobe -> false), baru ping tercepat. Proyeksi `select` tidak ikut berubah — tunnel_ok
+// hanya dipakai untuk mengurutkan.
+const POOL_ORDER_TUNNEL_OK = "tunnel_ok.desc.nullslast,ping.asc.nullslast";
+const POOL_ORDER_PING = "ping.asc.nullslast";
+// Kolom tunnel_ok ditambahkan manual ke tabel proxy_pool; selama belum ada, PostgREST
+// menolak urutan yang menyebutnya (400). Sekali ketahuan tidak ada, jangan bayar dua
+// request di setiap koneksi: ingat sebentar per isolate (SQL-nya bisa dijalankan kapan saja).
+const POOL_ORDER_MEMO_MS = 300000;
+let tunnelOkColumn = null; // null = belum diketahui, true = ada, false = tidak ada
+let tunnelOkColumnAt = 0;
 let fallbackUses = 0;
 
 // Watchdog: kalau klien sudah mengirim data tapi target tidak membalas apa pun selama
@@ -97,6 +108,7 @@ const counters = {
   proxyRetry: 0,
   rotateUsed: 0,
   rotateEmpty: 0,
+  poolOrder: 0,
 };
 // Berapa baris log yang benar-benar ditulis per jenis (sisanya ditahan gate). Dibedakan dari
 // `counters` supaya efektivitas gate bisa dipantau dari /health, bukan dari logs.
@@ -131,6 +143,20 @@ export default {
       }
 
       if (url.pathname === "/health") {
+        // Gating opsional: kalau env.HEALTH_TOKEN diisi, /health hanya menjawab dengan
+        // ?token=<nilai> atau header x-health-token. Ini menutup hitungan internal (counters,
+        // pool_cache, versi). Catatan: panel tidak mengirim token, jadi badge versi worker di
+        // dasbor berhenti muncul kalau gating diaktifkan.
+        const healthToken = String((env && env.HEALTH_TOKEN) || "");
+        if (healthToken) {
+          const given = url.searchParams.get("token") || request.headers.get("x-health-token") || "";
+          if (given !== healthToken) {
+            return new Response(JSON.stringify({ error: "unauthorized" }), {
+              status: 401,
+              headers: Object.assign({ "Content-Type": "application/json" }, CORS),
+            });
+          }
+        }
         return new Response(
           JSON.stringify({
             ok: true,
@@ -1049,19 +1075,45 @@ async function poolFallbacks(env) {
   return await poolProxies(env, []);
 }
 
+// Coba urutan tunnel_ok kecuali kolomnya sudah terbukti (masih dalam masa ingat) tidak ada.
+function preferTunnelOkOrder() {
+  if (tunnelOkColumn === true) return true;
+  if (tunnelOkColumn === false && Date.now() - tunnelOkColumnAt < POOL_ORDER_MEMO_MS) return false;
+  return true; // belum diketahui / ingatan kedaluwarsa: kolomnya mungkin sudah dibuat
+}
+
 async function fetchPoolProxies(env, countries) {
   try {
     const fresh = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
     const base = (env && env.FALLBACK_POOL_URL) || SUPABASE_URL;
     const table = (env && env.FALLBACK_TABLE) || "proxy_pool";
-    let url = String(base).replace(/\/$/, "") + "/rest/v1/" + table +
-      "?select=ip,port&is_active=eq.true&last_checked=gt." + encodeURIComponent(fresh);
-    if (countries && countries.length) url += "&country=in.(" + countries.join(",") + ")";
-    url += "&order=ping.asc.nullslast&limit=16";
-    const res = await withTimeout(fetch(url, {
-      headers: { apikey: SUPABASE_ANON_KEY, Authorization: "Bearer " + SUPABASE_ANON_KEY },
-    }), FALLBACK_FETCH_TIMEOUT);
+    const head = String(base).replace(/\/$/, "") + "/rest/v1/" + table +
+      "?select=ip,port&is_active=eq.true&last_checked=gt." + encodeURIComponent(fresh) +
+      (countries && countries.length ? "&country=in.(" + countries.join(",") + ")" : "");
+    const get = function (order) {
+      return withTimeout(fetch(head + "&order=" + order + "&limit=16", {
+        headers: { apikey: SUPABASE_ANON_KEY, Authorization: "Bearer " + SUPABASE_ANON_KEY },
+      }), FALLBACK_FETCH_TIMEOUT);
+    };
+
+    const tryTunnelOk = preferTunnelOkOrder();
+    let res = await get(tryTunnelOk ? POOL_ORDER_TUNNEL_OK : POOL_ORDER_PING);
+    let orderRejected = false;
+    if (!res.ok && tryTunnelOk) {
+      // Urutan ditolak (kolom tunnel_ok belum ada): ulangi SEKALI dengan query lama. Urutan
+      // tidak boleh menggagalkan pengambilan pool, jadi penolakan ini tetap diingat supaya
+      // koneksi berikutnya tidak mengulang dua request.
+      orderRejected = true;
+      tunnelOkColumn = false;
+      tunnelOkColumnAt = Date.now();
+      logLimited("poolOrder", "HTTP " + res.status);
+      res = await get(POOL_ORDER_PING);
+    }
     if (!res.ok) throw new Error("HTTP " + res.status);
+    if (tryTunnelOk && !orderRejected) {
+      tunnelOkColumn = true;
+      tunnelOkColumnAt = Date.now();
+    }
     const rows = await res.json();
     return rows
       .map(function (row) { return { host: row && row.ip, port: Number(row && row.port) }; })

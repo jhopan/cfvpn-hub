@@ -12,7 +12,8 @@
 //   7304 proxy SOCKS5 yang menerima no-auth: mencatat ATYP + alamat tujuan
 //   7306 proxy HTTP-only kedua: menguji protokol proxy diingat antar koneksi
 //   7308 proxy "setengah mati": handshake sukses lalu tidak pernah mengirim data
-//   7309 REST proxy_pool palsu: mengembalikan satu baris {ip,port} untuk uji failover pool
+//   7309 REST proxy_pool palsu: menolak urutan tunnel_ok (400, kolom dianggap belum ada),
+//        tapi menjawab query urutan lama — untuk uji jalur mundur + ingatan
 //   7311 proxy HTTP-only yang diam terhadap SOCKS5: uji race protokol
 //   7312 proxy yang mengirim 20 potongan 256 B berjarak ~1 ms: uji batching socket->WS
 //
@@ -43,13 +44,15 @@
 //  23b. Path /rotate & /pool: worker memilih proxy sendiri (statis dan dari pool)
 //  23c. Path /SG: pool difilter negara (country=in.(SG)) sebelum dipilih acak
 //  23d. Path /XX: selector negara gagal-tertutup, bukan pindah ke proxy negara lain
+//  23e. Kolom tunnel_ok belum ada (400): pool tetap terisi lewat urutan lama, dan worker
+//       tidak mengulang percobaan urutan itu di pengambilan berikutnya (worker keenam)
 //  24. Early data lewat query ?ed= tanpa mengirim pesan WS
 //  25. Protokol belum diketahui: SOCKS5 & HTTP CONNECT dicoba paralel (bukan berurutan)
 //  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
 //  27. Batching dimatikan (WS_BATCH_MS=0): satu pesan per potongan (pembanding)
 //  28. Log dibatasi: 3 kegagalan proxy -> 1 baris log, counter /health tetap naik
 //
-// Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+3).
+// Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+5).
 import net from "node:net";
 import http from "node:http";
 import dgram from "node:dgram";
@@ -68,6 +71,8 @@ const PORT_DOH = PORT + 1;
 const PORT_IDLE = PORT + 2;
 const PORT_POOL = PORT + 3;
 const PORT_RELAY = PORT + 4;
+const PORT_ORDER = PORT + 5;
+const PORT_TOKEN = PORT + 6; // uji gerbang /health (HEALTH_TOKEN)
 // Target IPv6 tetap untuk uji (2001:db8::1) — ditulis apa adanya supaya uji tidak memakai
 // parser yang sedang diuji.
 const IPV6_TARGET = "2001:db8::1";
@@ -81,7 +86,7 @@ const S = {
   proxy: { socks5: 0, http: 0, closes: 0, connectLines: [], byPort: {}, echoed: false, closeAfterEcho: false },
   socks: { greeting: 0, requests: [], closes: 0, echoed: false },
   silent: { handshakes: 0 },
-  pool: { requests: [] },
+  pool: { requests: [], tunnelOkRejected: 0 },
   race: { socksSilent: 0, http: 0, closes: 0, echoed: false },
   udp: { messages: 0, last: "" },
   stream: { chunks: 0, }, 
@@ -232,14 +237,22 @@ function dnsAnswerFor(query) {
 
 // --- stub pool proxy (meniru REST proxy_pool Supabase) --------------------------------
 // Mengembalikan satu baris {ip,port} yang menunjuk ke proxy HTTP-only 7302, supaya jalur
-// failover dari pool bisa diuji tanpa menyentuh Supabase.
+// failover dari pool bisa diuji tanpa menyentuh Supabase. Urutan `tunnel_ok` selalu ditolak
+// 400: kolom itu ditambahkan lewat SQL manual, jadi worker harus tahan saat belum ada.
 const startPoolStub = () =>
   new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
-      S.pool.requests.push(req.url);
+      const url = req.url || "";
+      S.pool.requests.push(url);
+      if (/order=tunnel_ok\./.test(url)) {
+        S.pool.tunnelOkRejected++;
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code: "42703", message: "column proxy_pool.tunnel_ok does not exist" }));
+        return;
+      }
       // Jawab sesuai filter: tanpa filter -> "7302", SG -> "7306", negara lain -> kosong.
       // Yang kosong dipakai untuk membuktikan selector negara gagal-tertutup.
-      const filter = ((req.url || "").match(/country=in\.\(([^)]*)\)/) || [])[1];
+      const filter = (url.match(/country=in\.\(([^)]*)\)/) || [])[1];
       const rows = filter
         ? (/SG/.test(filter) ? [{ ip: "127.0.0.1", port: 7306 }] : [])
         : [{ ip: "127.0.0.1", port: 7302 }];
@@ -1277,6 +1290,77 @@ async function scenarioCountryClosed(port) {
   };
 }
 
+// Kolom `tunnel_ok` ditambahkan ke tabel proxy_pool lewat SQL manual, jadi worker harus tetap
+// hidup saat kolomnya BELUM ada: stub pool menolak 400 setiap query yang mengurutkan dengannya
+// dan hanya menjawab query lama. Worker harus tetap mendapat daftar proxy (echo jalan), lalu
+// MENGINGAT penolakan itu sehingga pengambilan pool berikutnya tidak lagi mencoba urutan
+// tunnel_ok (jangan dua request di setiap koneksi). Dipakai worker terpisah supaya isolate-nya
+// bersih: percobaan pertama memang harus kena 400 di sini, bukan mengandalkan ingatan worker lain.
+async function scenarioPoolOrderFallback(port) {
+  const payload = Buffer.from("PING");
+  const connectOnce = async (selector) => {
+    S.proxy.echoed = false;
+    const { ws, received } = await openWs(selector, port);
+    ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
+    const echoed = await until(() => received().length >= 8, 12000);
+    const got = received();
+    try { ws.close(); } catch {}
+    return echoed && got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
+  };
+  const count = (urls, re) => urls.filter((url) => re.test(url || "")).length;
+
+  // Fase 1: kunci "all" perdana di isolate ini -> urutan tunnel_ok dicoba, ditolak, lalu diulang.
+  S.pool.requests = [];
+  const rejectedBefore = S.pool.tunnelOkRejected;
+  const allEcho = await connectOnce("/ALL");
+  const allTunnelOk = count(S.pool.requests, /order=tunnel_ok\./);
+  const allLegacy = count(S.pool.requests, /order=ping\.asc\.nullslast/);
+  const allRejected = S.pool.tunnelOkRejected - rejectedBefore;
+
+  // Fase 2: kunci baru (/SG) -> percobaan ulang tidak boleh terlihat lagi (ingatan ~5 menit).
+  S.pool.requests = [];
+  const sgEcho = await connectOnce("/SG");
+  const sgTunnelOk = count(S.pool.requests, /order=tunnel_ok\./);
+  const sgLegacy = count(S.pool.requests, /order=ping\.asc\.nullslast/);
+
+  const health = await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
+  const used = health.counters ? health.counters.rotateUsed : -1;
+  // echo lewat pool membuktikan daftarnya tetap tiba: worker ini tidak punya FALLBACK_PROXIES,
+  // dan stub hanya mengembalikan baris untuk query lama.
+  return {
+    name: "Pool: kolom tunnel_ok belum ada (400) -> urutan lama dipakai lalu diingat",
+    pass: allEcho && sgEcho && allTunnelOk >= 1 && allRejected >= 1 && allLegacy >= 1 &&
+      sgTunnelOk === 0 && sgLegacy >= 1 && used >= 2,
+    detail: `echo=${allEcho},${sgEcho} rotateUsed=${used} fase1(/ALL): tunnel_ok=${allTunnelOk} ditolak=${allRejected} lama=${allLegacy} · fase2(/SG): tunnel_ok=${sgTunnelOk} lama=${sgLegacy}`,
+  };
+}
+
+// Gerbang /health: dengan env.HEALTH_TOKEN, /health menutup hitungan internal kecuali token
+// dikirim lewat ?token= atau header x-health-token. Tanpa env, endpoint tetap terbuka (uji lain
+// memakainya bebas).
+async function scenarioHealthToken(port, token) {
+  const statusOf = async (path, headers) => {
+    const res = await fetch("http://127.0.0.1:" + port + path, { headers: headers || {} });
+    return { status: res.status, body: await res.text().catch(() => "") };
+  };
+  const closed = await statusOf("/health");
+  const viaQuery = await statusOf("/health?token=" + encodeURIComponent(token));
+  const viaHeader = await statusOf("/health", { "x-health-token": token });
+  const wrong = await statusOf("/health?token=salah");
+  const myip = await statusOf("/myip");
+  let parsed = {};
+  try { parsed = JSON.parse(viaQuery.body); } catch {}
+  const pass = closed.status === 401 && wrong.status === 401
+    && viaQuery.status === 200 && viaHeader.status === 200
+    && parsed && parsed.ok === true && myip.status === 200;
+  return {
+    name: "Gerbang /health: mati tanpa HEALTH_TOKEN, 401 tanpa token, 200 dengan token",
+    detail: "closed=" + closed.status + " salah=" + wrong.status + " query=" + viaQuery.status
+      + " header=" + viaHeader.status + " myip=" + myip.status + " ok=" + Boolean(parsed && parsed.ok === true),
+    pass,
+  };
+}
+
 function tierCheck() {
   const prem = fs.readFileSync(SOURCE);
   const free = fs.readFileSync(SOURCE_FREE);
@@ -1400,6 +1484,39 @@ try {
     throw new Error("wrangler dev (uji relay UDP) tidak siap pada port " + PORT_RELAY + "\n" + workers[workers.length - 1].getOut().slice(-1500));
   }
   results.push(await scenarioUdpRelay(PORT_RELAY, () => relay.getOut()));
+
+  // Worker keenam: urutan pool saat kolom tunnel_ok belum ada. Isolate harus bersih supaya
+  // percobaan 400 -> ulangi benar-benar terjadi di skenario 23e, bukan tersembunyi di ingatan
+  // worker pool yang sudah jalan sebelumnya.
+  const orderDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-order-"));
+  workdirs.push(orderDir);
+  makeFixture(orderDir, {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    FALLBACK_POOL: "on",
+    FALLBACK_POOL_URL: "http://127.0.0.1:7309",
+  });
+  const orderWorker = startWorker(orderDir, PORT_ORDER);
+  workers.push(orderWorker);
+  if (!(await waitPort(PORT_ORDER, 120000))) {
+    throw new Error("wrangler dev (uji urutan pool) tidak siap pada port " + PORT_ORDER + "\n" + orderWorker.getOut().slice(-1500));
+  }
+  results.push(await scenarioPoolOrderFallback(PORT_ORDER));
+
+  // Worker ketujuh: /health digerbang HEALTH_TOKEN.
+  const tokenDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-token-"));
+  workdirs.push(tokenDir);
+  const healthToken = "rahasia-health";
+  makeFixture(tokenDir, {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    FALLBACK_POOL: "off",
+    HEALTH_TOKEN: healthToken,
+  });
+  const tokenWorker = startWorker(tokenDir, PORT_TOKEN);
+  workers.push(tokenWorker);
+  if (!(await waitPort(PORT_TOKEN, 120000))) {
+    throw new Error("wrangler dev (uji health token) tidak siap pada port " + PORT_TOKEN + "\n" + tokenWorker.getOut().slice(-1500));
+  }
+  results.push(await scenarioHealthToken(PORT_TOKEN, healthToken));
 
   results.push(tierCheck());
 } catch (err) {
