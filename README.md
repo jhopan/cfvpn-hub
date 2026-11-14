@@ -194,8 +194,8 @@ memeriksa/mematikan**: baris yang gagal dimatikan, sedangkan yang menyalakan kem
 panproxyscanner (pipeline produksi). Sebelumnya penentu
 adalah cek ringan 5 detik, dan itu salah dua arah — terukur 15 baris terbukti tembus justru
 dimatikan, 7 baris aktif tapi terbukti mati.
-Worker memakai rantai tiga tingkat saat memilih proxy dari pool:
-`tunnel_ok` (verdict edge) → `tls_ok` (bukti host dari panproxyscanner) → ping. Baris dengan
+Worker memakai rantai empat tingkat saat memilih proxy dari pool:
+`tunnel_ok` (verdict edge) → `tls_ok` (bukti host TLS) → `tunnel_host_ok` (bukti tunnel dari host scanner) → ping. Baris dengan
 `tunnel_ok = false` diletakkan paling belakang karena worker VLESS berjalan di edge, jadi vonis edge
 yang menentukan — pengukuran 14 Nov menunjukkan 42 dari 72 baris aktif ber-`tls_ok = true` tapi
 `tunnel_ok = false`.

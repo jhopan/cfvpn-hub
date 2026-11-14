@@ -13,10 +13,11 @@
 //   7306 proxy HTTP-only kedua: menguji protokol proxy diingat antar koneksi
 //   7308 proxy "setengah mati": handshake sukses lalu tidak pernah mengirim data
 //   7309 REST proxy_pool palsu: bisa menyembunyikan kolom bukti (400, dianggap belum ada) —
-//        bawaannya `tunnel_ok` hilang, `tls_ok` bisa disembunyikan per skenario. Query yang
-//        diterima dijawab dengan daftar proxy sungguhan. Tanpa filter negara ia mengembalikan
-//        DUA baris berurutan (7316 lalu 7302); tabel terpisah "proxy_pool_dead_first"
-//        mengembalikan baris pertama 127.0.0.1:7307 (tanpa pendengar)
+//        bawaannya KETIGA kolom bukti (`tunnel_ok`, `tls_ok`, `tunnel_host_ok`) hilang; skenario
+//        bisa memilih kolom mana yang disembunyikan. Query yang diterima dijawab dengan daftar
+//        proxy sungguhan. Tanpa filter negara ia mengembalikan DUA baris berurutan (7316 lalu
+//        7302); tabel terpisah "proxy_pool_dead_first" mengembalikan baris pertama
+//        127.0.0.1:7307 (tanpa pendengar)
 //   7311 proxy HTTP-only yang diam terhadap SOCKS5: uji race protokol
 //   7312 proxy yang mengirim 20 potongan 256 B berjarak ~1 ms: uji batching socket->WS
 //   7316 proxy HTTP-only ketiga: baris PERTAMA yang dikembalikan stub pool (uji "tercepat dulu")
@@ -48,15 +49,19 @@
 //  23b. Path /rotate & /pool: worker memilih proxy sendiri (statis dan dari pool)
 //  23c. Path /SG: pool difilter negara (country=in.(SG)) sebelum dipilih acak
 //  23d. Path /XX: selector negara gagal-tertutup, bukan pindah ke proxy negara lain
-//  23e. Kolom tunnel_ok belum ada (400): pool tetap terisi lewat urutan ke-3 (ping) setelah
-//       dua urutan bukti ditolak, dan worker tidak mengulang percobaan urutan itu di
-//       pengambilan berikutnya (worker keenam)
+//  23e. Semua kolom bukti belum ada (400): urutan 1..3 ditolak, pool tetap terisi lewat
+//       urutan ke-4 (ping), dan worker tidak mengulang percobaan urutan itu di pengambilan
+//       berikutnya (worker keenam)
 //  23f. Pool "tercepat dulu": /ALL memakai baris PERTAMA pool (7316) dan tidak menyentuh baris
 //       kedua (7302) selama yang teratas sehat
 //  23g. Baris pertama pool mati (127.0.0.1:7307) -> jalur cadangan tetap sampai baris kedua
 //       (7302) dan echo jalan; worker terpisah supaya cache pool kunci "all" bersih
-//  23h. Kolom tls_ok belum ada (400) tapi tunnel_ok ada: worker jatuh ke urutan ke-2
-//       (tunnel_ok + ping), bukan sampai urutan ping saja, lalu mengingatnya (worker kesembilan)
+//  23h. `tunnel_host_ok` (bukti host scanner) ada -> urutan 1 (empat tingkat) langsung dipakai,
+//       tanpa satu pun 400 (worker kesepuluh)
+//  23i. `tunnel_host_ok` belum ada (400): worker jatuh ke urutan 2 (tunnel_ok + tls_ok + ping),
+//       bukan ke urutan ping saja, lalu mengingatnya (worker kesebelas)
+//  23j. `tls_ok` & `tunnel_host_ok` belum ada (400): worker jatuh ke urutan 3
+//       (tunnel_ok + ping), bukan ke urutan ping saja, lalu mengingatnya (worker kesembilan)
 //  24. Early data lewat query ?ed= tanpa mengirim pesan WS
 //  25. Protokol belum diketahui: SOCKS5 & HTTP CONNECT dicoba paralel (bukan berurutan)
 //  26. Batching WS aktif: potongan kecil digabung jadi sedikit pesan
@@ -67,7 +72,7 @@
 //  30. Tier Free: binding RELAY_SERVER_UDP diabaikan -> UDP non-DNS ditutup cepat, tidak ada
 //      satu pun lalu lintas relay (relay tidak mencatat sesi ke port tujuan itu)
 //
-// Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+7).
+// Port worker bisa diganti lewat SMOKE_PORT (bawaan 8787; worker lain memakai port+1..+11).
 import net from "node:net";
 import http from "node:http";
 import dgram from "node:dgram";
@@ -90,7 +95,9 @@ const PORT_ORDER = PORT + 5;
 const PORT_TOKEN = PORT + 6; // uji gerbang /health (HEALTH_TOKEN)
 const PORT_FREE = PORT + 7; // worker dari berkas tier Free (relay UDP diabaikan)
 const PORT_POOL_DEAD = PORT + 8; // worker pool dengan baris TERATAS mati (tabel pool terpisah)
-const PORT_POOL_TLS = PORT + 9; // worker pool saat kolom tls_ok belum ada (tunnel_ok ada)
+const PORT_POOL_TLS = PORT + 9; // worker pool saat tls_ok & tunnel_host_ok belum ada
+const PORT_POOL_HOST = PORT + 10; // worker pool dengan skema LENGKAP (semua kolom bukti ada)
+const PORT_POOL_HOST_MISSING = PORT + 11; // worker pool saat tunnel_host_ok belum ada
 // Target IPv6 tetap untuk uji (2001:db8::1) — ditulis apa adanya supaya uji tidak memakai
 // parser yang sedang diuji.
 const IPV6_TARGET = "2001:db8::1";
@@ -104,7 +111,7 @@ const S = {
   proxy: { socks5: 0, http: 0, closes: 0, connectLines: [], byPort: {}, echoed: false, closeAfterEcho: false },
   socks: { greeting: 0, requests: [], closes: 0, echoed: false },
   silent: { handshakes: 0 },
-  pool: { requests: [], orderRejected: 0, missing: ["tunnel_ok"] },
+  pool: { requests: [], orderRejected: 0, missing: ["tunnel_ok", "tls_ok", "tunnel_host_ok"] },
   race: { socksSilent: 0, http: 0, closes: 0, echoed: false },
   udp: { messages: 0, last: "" },
   stream: { chunks: 0, }, 
@@ -261,11 +268,11 @@ function dnsAnswerFor(query) {
 // saat kandidat teratas mati. Alamat mati sengaja port lokal tanpa pendengar (pola uji failover
 // statis di skenario 15/23): SYN ke TEST-NET-1 (192.0.2.1) bisa menggantung puluhan detik,
 // sehingga pencatatan kegagalan proxy utama di /health tidak sempat terlihat di jendela uji.
-// Kolom bukti (`tunnel_ok` dari edge, `tls_ok` dari host scanner) ditambahkan lewat SQL manual,
-// jadi stub bisa MENYEMBUNYIKAN kolom mana pun (balas 400 seperti PostgREST) dan hanya menjawab
-// query yang tidak menyebutnya. Bawaannya `tunnel_ok` hilang: skema terlama yang harus tetap
-// jalan. `S.pool.missing` diganti per skenario (bukan global selamanya) supaya rantai mundur
-// tiga tingkat bisa diuji satu per satu.
+// Kolom bukti (`tunnel_ok` dari edge, `tls_ok` dari host scanner, `tunnel_host_ok` dari host
+// scanner) ditambahkan lewat SQL manual, jadi stub bisa MENYEMBUNYIKAN kolom mana pun (balas 400
+// seperti PostgREST) dan hanya menjawab query yang tidak menyebutnya. Bawaannya KETIGA kolom
+// hilang: skema terlama yang harus tetap jalan. `S.pool.missing` diganti per skenario (bukan
+// global selamanya) supaya rantai mundur empat tingkat bisa diuji satu per satu.
 const POOL_TABLE_DEAD_FIRST = "proxy_pool_dead_first";
 const POOL_FAST_PORT = 7316; // baris pertama tabel "proxy_pool" (proxy HTTP-only + echo)
 const POOL_DEAD_PORT = 7307; // baris pertama tabel "proxy_pool_dead_first" (tidak ada pendengar)
@@ -1371,16 +1378,39 @@ async function scenarioCountryClosed(port) {
   };
 }
 
-// Kolom bukti (`tunnel_ok` dari edge, `tls_ok` dari host scanner) ditambahkan ke tabel
-// proxy_pool lewat SQL manual, jadi worker harus tetap hidup saat kolomnya BELUM ada: stub pool
-// membalas 400 setiap query yang menyebut kolom hilang dan hanya menjawab urutan yang lebih
-// tua. Worker harus tetap mendapat daftar proxy (echo jalan), lalu MENGINGAT penolakan itu
-// sehingga pengambilan pool berikutnya tidak lagi mencoba urutan yang ditolak (jangan bayar
-// dua request di setiap koneksi). Dipakai worker terpisah supaya isolate-nya bersih: percobaan
-// pertama memang harus kena 400 di sini, bukan mengandalkan ingatan worker lain.
-// Skenario ini = skema terlama: `tunnel_ok` TIDAK ada (bawaan stub), jadi urutan 1 dan urutan 2
-// — keduanya menyebut tunnel_ok — ditolak, dan worker mendarat di urutan 3 (ping saja).
-async function scenarioPoolOrderFallback(port) {
+// Kolom bukti (`tunnel_ok` dari edge, `tls_ok` dan `tunnel_host_ok` dari host scanner)
+// ditambahkan ke tabel proxy_pool lewat SQL manual, jadi worker harus tetap hidup saat kolomnya
+// BELUM ada: stub pool membalas 400 setiap query yang menyebut kolom hilang dan hanya menjawab
+// urutan yang lebih tua. Worker harus tetap mendapat daftar proxy (echo jalan), lalu MENGINGAT
+// urutan yang diterima sehingga pengambilan pool berikutnya tidak lagi membayar percobaan yang
+// sudah terbukti gagal.
+//
+// Empat skenario di bawah memakai satu runner: fase 1 memakai kunci cache "all" yang masih
+// perawan di isolate itu (jadi rantai urutan benar-benar disusuri dari atas), fase 2 memakai
+// kunci negara "SG" sehingga bukan cache pool — yang diuji di sana adalah INGATAN isolate
+// (langsung urutan yang sudah diterima, tanpa 400 lagi). Urutan pool tidak pernah menggagalkan
+// pengambilan pool: echo di kedua fase adalah buktinya.
+// Urutan query dibaca dari pencatatan stub, bukan dari log worker: regex diberi anchor `&`/akhir
+// supaya urutan 1 tidak ikut terhitung sebagai urutan 2/3 (semuanya memuat "ping").
+const POOL_TIER_ORDERS = [
+  /order=tunnel_ok\.desc\.nullslast,tls_ok\.desc\.nullslast,tunnel_host_ok\.desc\.nullslast,ping\.asc\.nullslast(&|$)/,
+  /order=tunnel_ok\.desc\.nullslast,tls_ok\.desc\.nullslast,ping\.asc\.nullslast(&|$)/,
+  /order=tunnel_ok\.desc\.nullslast,ping\.asc\.nullslast(&|$)/,
+  /order=ping\.asc\.nullslast(&|$)/,
+];
+
+// Indeks urutan (0..3 = urutan 1..4 di worker) untuk tiap query pool yang dicatat stub.
+// -1 = tidak dikenali, jadi perbandingan urutan pasti gagal (bukan lolos diam-diam).
+function poolOrderTiers(urls) {
+  return (urls || []).map((url) => POOL_TIER_ORDERS.findIndex((re) => re.test(String(url || ""))));
+}
+
+function sameNumbers(left, right) {
+  return left.length === right.length && left.every((value, i) => value === right[i]);
+}
+
+// expectTier: indeks urutan yang HARUS diterima (0 = urutan 1 empat tingkat, 3 = ping saja).
+async function scenarioPoolOrder(port, name, expectTier) {
   const payload = Buffer.from("PING");
   const connectOnce = async (selector) => {
     S.proxy.echoed = false;
@@ -1391,102 +1421,73 @@ async function scenarioPoolOrderFallback(port) {
     try { ws.close(); } catch {}
     return echoed && got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
   };
-  const count = (urls, re) => urls.filter((url) => re.test(url || "")).length;
   const healthOf = async () => await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
   const before = await healthOf();
 
-  // Fase 1: kunci "all" perdana di isolate ini -> urutan 1 & 2 dicoba, ditolak, lalu urutan 3.
+  // Fase 1: urutan 1..expectTier+1 harus dicoba BERURUTAN, ditolak sebanyak expectTier, lalu
+  // urutan expectTier+1 diterima.
   S.pool.requests = [];
   const rejectedBefore = S.pool.orderRejected;
   const allEcho = await connectOnce("/ALL");
-  const allEdge = count(S.pool.requests, /order=tunnel_ok\./);
-  const allLegacy = count(S.pool.requests, /order=ping\.asc\.nullslast/);
+  const allTiers = poolOrderTiers(S.pool.requests);
   const allRejected = S.pool.orderRejected - rejectedBefore;
   const mid = await healthOf();
 
-  // Fase 2: kunci baru (/SG) -> percobaan urutan bukti tidak boleh terlihat lagi (ingatan ~5 menit).
+  // Fase 2: kunci baru (/SG) -> langsung urutan yang sudah diingat, tanpa satu pun 400.
   S.pool.requests = [];
   const sgEcho = await connectOnce("/SG");
-  const sgEdge = count(S.pool.requests, /order=tunnel_ok\./);
-  const sgLegacy = count(S.pool.requests, /order=ping\.asc\.nullslast/);
+  const sgTiers = poolOrderTiers(S.pool.requests);
 
   const after = await healthOf();
   // counters.poolOrder naik sekali untuk tiap urutan yang ditolak (lewat gate log) + sekali saat
-  // akhirnya turun ke urutan yang lebih tua. Fase 2 harus NOL: ingatan isolate sudah menunjuk
-  // urutan 3, jadi koneksi berikutnya tidak membayar percobaan yang sudah terbukti gagal.
+  // akhirnya turun ke urutan yang lebih tua; urutan 1 yang langsung diterima tidak menaikkannya.
   const order = (snap) => Number((snap.counters || {}).poolOrder || 0);
   const fase1Memo = order(mid) - order(before);
   const fase2Memo = order(after) - order(mid);
   const used = after.counters ? after.counters.rotateUsed : -1;
-  // echo lewat pool membuktikan daftarnya tetap tiba walau dua urutan ditolak: "urutan tidak
-  // pernah menggagalkan pengambilan pool" (worker ini tanpa FALLBACK_PROXIES).
+  const expectSteps = Array.from({ length: expectTier + 1 }, (_, i) => i);
+  const expectMemo = expectTier === 0 ? 0 : expectTier + 1;
   return {
-    name: "Pool: kolom tunnel_ok & tls_ok belum ada (400) -> urutan ping dipakai lalu diingat",
-    pass: allEcho && sgEcho && allEdge >= 2 && allRejected >= 2 && allLegacy >= 1 &&
-      sgEdge === 0 && sgLegacy >= 1 && fase1Memo === allRejected + 1 && fase2Memo === 0 &&
+    name: name,
+    pass: allEcho && sgEcho && sameNumbers(allTiers, expectSteps) && allRejected === expectTier &&
+      sameNumbers(sgTiers, [expectTier]) && fase1Memo === expectMemo && fase2Memo === 0 &&
       used >= 2,
     detail: `echo=${allEcho},${sgEcho} rotateUsed=${used} poolOrder fase1=+${fase1Memo}` +
-      `(harap +${allRejected + 1}) fase2=+${fase2Memo} ` +
-      `fase1(/ALL): urutanBukti=${allEdge} ditolak=${allRejected} ping=${allLegacy} · ` +
-      `fase2(/SG): urutanBukti=${sgEdge} ping=${sgLegacy} poolCache=${JSON.stringify(after.pool_cache)}`,
+      `(harap +${expectMemo}) fase2=+${fase2Memo} ` +
+      `fase1(/ALL): urutan=${JSON.stringify(allTiers)} harap ${JSON.stringify(expectSteps)} ` +
+      `ditolak=${allRejected} · fase2(/SG): urutan=${JSON.stringify(sgTiers)} harap [${expectTier}] ` +
+      `poolCache=${JSON.stringify(after.pool_cache)}`,
   };
 }
 
-// Varian skema tengah: `tls_ok` (bukti host scanner) BELUM ada sementara `tunnel_ok` (bukti
-// edge) sudah. Worker harus mendarat di urutan 2 (tunnel_ok + ping) — bukti edge tetap dipakai
-// mengurutkan — bukan turun sampai urutan ping saja. Urutan 1 ditolak 400, urutan 2 diterima,
-// lalu diingat. Worker terpisah supaya ingatan worker 23e tidak menyamarkan percobaan ini.
+// 23h: skema terbaru — ketiga kolom bukti ada (`tunnel_host_ok` sudah ditambahkan lewat SQL
+// manusia). Urutan 1 (empat tingkat) harus dipakai sejak pengambilan pool pertama, tanpa 400.
+async function scenarioPoolOrderComplete(port) {
+  return await scenarioPoolOrder(port,
+    "Pool: semua kolom bukti ada -> urutan 1 (tunnel_ok,tls_ok,tunnel_host_ok,ping) dipakai", 0);
+}
+
+// 23i: `tunnel_host_ok` (bukti tunnel dari host scanner) BELUM ada, `tunnel_ok` dan `tls_ok`
+// sudah. Worker harus mendarat di urutan 2 (tunnel_ok + tls_ok + ping): dua bukti terkuat tetap
+// dipakai mengurutkan, tidak kehilangan pool dan tidak turun ke ping saja.
+async function scenarioPoolOrderHostMissing(port) {
+  return await scenarioPoolOrder(port,
+    "Pool: tunnel_host_ok belum ada (400) -> urutan 2 (tunnel_ok,tls_ok,ping) dipakai lalu diingat", 1);
+}
+
+// 23j: `tls_ok` dan `tunnel_host_ok` BELUM ada (skema sebelum host scanner mengisi keduanya):
+// urutan 1 dan 2 ditolak 400, worker mendarat di urutan 3 (tunnel_ok + ping). Bukti edge tetap
+// dipakai mengurutkan — bukan turun sampai ping saja.
 async function scenarioPoolOrderTlsMissing(port) {
-  const payload = Buffer.from("PING");
-  const connectOnce = async (selector) => {
-    S.proxy.echoed = false;
-    const { ws, received } = await openWs(selector, port);
-    ws.send(frame({ cmd: 1, host: "example.com", port: 80, payload }));
-    const echoed = await until(() => received().length >= 8, 12000);
-    const got = received();
-    try { ws.close(); } catch {}
-    return echoed && got.length >= 4 && got.subarray(0, 4).toString("hex") === "00005566";
-  };
-  const count = (urls, re) => urls.filter((url) => re.test(url || "")).length;
-  const tlsOrder = /order=[^&]*tls_ok\./; // urutan 1 (menyebut bukti host scanner)
-  const edgeOrder = /order=tunnel_ok\.desc\.nullslast,ping\.asc\.nullslast(&|$)/; // urutan 2
-  const pingOnly = /order=ping\.asc\.nullslast/; // urutan 3
-  const healthOf = async () => await (await fetch("http://127.0.0.1:" + port + "/health")).json().catch(() => ({}));
-  const before = await healthOf();
+  return await scenarioPoolOrder(port,
+    "Pool: tls_ok & tunnel_host_ok belum ada (400) -> urutan 3 (tunnel_ok,ping) dipakai lalu diingat", 2);
+}
 
-  // Fase 1: urutan 1 ditolak (tls_ok tidak ada) -> urutan 2 diterima, urutan 3 tidak disentuh.
-  S.pool.requests = [];
-  const rejectedBefore = S.pool.orderRejected;
-  const allEcho = await connectOnce("/ALL");
-  const allTls = count(S.pool.requests, tlsOrder);
-  const allEdgeOrder = count(S.pool.requests, edgeOrder);
-  const allPing = count(S.pool.requests, pingOnly);
-  const allRejected = S.pool.orderRejected - rejectedBefore;
-  const mid = await healthOf();
-
-  // Fase 2: kunci baru (/SG) -> urutan 1 tidak dicoba lagi (ingatan), langsung urutan 2.
-  S.pool.requests = [];
-  const sgEcho = await connectOnce("/SG");
-  const sgTls = count(S.pool.requests, tlsOrder);
-  const sgEdgeOrder = count(S.pool.requests, edgeOrder);
-  const sgPing = count(S.pool.requests, pingOnly);
-
-  const after = await healthOf();
-  // Sama seperti skenario 23e: hitungan poolOrder = urutan ditolak + 1 kali turun urutan.
-  const order = (snap) => Number((snap.counters || {}).poolOrder || 0);
-  const fase1Memo = order(mid) - order(before);
-  const fase2Memo = order(after) - order(mid);
-  const used = after.counters ? after.counters.rotateUsed : -1;
-  return {
-    name: "Pool: kolom tls_ok belum ada (400) -> urutan tunnel_ok+ping dipakai lalu diingat",
-    pass: allEcho && sgEcho && allTls >= 1 && allRejected === 1 && allEdgeOrder >= 1 &&
-      allPing === 0 && sgTls === 0 && sgEdgeOrder >= 1 && sgPing === 0 &&
-      fase1Memo === allRejected + 1 && fase2Memo === 0 && used >= 2,
-    detail: `echo=${allEcho},${sgEcho} rotateUsed=${used} poolOrder fase1=+${fase1Memo}` +
-      `(harap +${allRejected + 1}) fase2=+${fase2Memo} ` +
-      `fase1(/ALL): tls=${allTls} ditolak=${allRejected} urutan2=${allEdgeOrder} ping=${allPing} · ` +
-      `fase2(/SG): tls=${sgTls} urutan2=${sgEdgeOrder} ping=${sgPing} poolCache=${JSON.stringify(after.pool_cache)}`,
-  };
+// 23e: skema terlama — KETIGA kolom bukti belum ada (bawaan stub): urutan 1, 2, dan 3 ditolak
+// 400, worker mendarat di urutan 4 (ping) dan tetap mendapat daftar proxy.
+async function scenarioPoolOrderFallback(port) {
+  return await scenarioPoolOrder(port,
+    "Pool: semua kolom bukti belum ada (400) -> urutan 4 (ping) dipakai lalu diingat", 3);
 }
 
 // "Tercepat dulu": stub pool (tabel "proxy_pool") mengembalikan 7316 sebagai baris PERTAMA lalu
@@ -1744,9 +1745,9 @@ try {
   }
   results.push(await scenarioFreeTierRelayBlocked(PORT_FREE, () => relay.getOut()));
 
-  // Worker keenam: urutan pool saat kolom tunnel_ok belum ada. Isolate harus bersih supaya
-  // percobaan 400 -> ulangi benar-benar terjadi di skenario 23e, bukan tersembunyi di ingatan
-  // worker pool yang sudah jalan sebelumnya.
+  // Worker keenam: urutan pool saat KETIGA kolom bukti belum ada (bawaan stub). Isolate harus
+  // bersih supaya percobaan 400 -> ulangi benar-benar terjadi di skenario 23e, bukan tersembunyi
+  // di ingatan worker pool yang sudah jalan sebelumnya.
   const orderDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-order-"));
   workdirs.push(orderDir);
   makeFixture(orderDir, {
@@ -1761,9 +1762,10 @@ try {
   }
   results.push(await scenarioPoolOrderFallback(PORT_ORDER));
 
-  // Worker kesembilan: skema tengah — `tls_ok` belum ada, `tunnel_ok` sudah. Stub disembunyikan
-  // kolom tls_ok HANYA selama worker ini dipakai, lalu dikembalikan ke bawaan (tunnel_ok hilang)
-  // supaya skenario sesudahnya tetap menguji skema terlama.
+  // Worker kesembilan: skema tengah — `tls_ok` dan `tunnel_host_ok` (dua bukti dari host
+  // scanner) belum ada sementara `tunnel_ok` sudah. Stub menyembunyikan keduanya HANYA selama
+  // worker ini dipakai, lalu dikembalikan ke bawaan (ketiga kolom hilang) supaya skenario
+  // sesudahnya tetap menguji skema terlama.
   const tlsDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-order-tls-"));
   workdirs.push(tlsDir);
   makeFixture(tlsDir, {
@@ -1771,14 +1773,49 @@ try {
     FALLBACK_POOL: "on",
     FALLBACK_POOL_URL: "http://127.0.0.1:7309",
   });
-  S.pool.missing = ["tls_ok"];
+  S.pool.missing = ["tls_ok", "tunnel_host_ok"];
   const tlsWorker = startWorker(tlsDir, PORT_POOL_TLS);
   workers.push(tlsWorker);
   if (!(await waitPort(PORT_POOL_TLS, 120000))) {
-    throw new Error("wrangler dev (uji urutan pool tanpa tls_ok) tidak siap pada port " + PORT_POOL_TLS + "\n" + tlsWorker.getOut().slice(-1500));
+    throw new Error("wrangler dev (uji urutan pool tanpa tls_ok & tunnel_host_ok) tidak siap pada port " + PORT_POOL_TLS + "\n" + tlsWorker.getOut().slice(-1500));
   }
   results.push(await scenarioPoolOrderTlsMissing(PORT_POOL_TLS));
-  S.pool.missing = ["tunnel_ok"];
+  S.pool.missing = ["tunnel_ok", "tls_ok", "tunnel_host_ok"];
+
+  // Worker kesepuluh: skema TERBARU — ketiga kolom bukti ada (`tunnel_host_ok` sudah ditambahkan
+  // lewat SQL manual). Stub tidak menyembunyikan apa pun selama worker ini dipakai, jadi urutan 1
+  // (empat tingkat) harus langsung diterima pada pengambilan pool pertama isolate ini.
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-order-host-"));
+  workdirs.push(hostDir);
+  makeFixture(hostDir, {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    FALLBACK_POOL: "on",
+    FALLBACK_POOL_URL: "http://127.0.0.1:7309",
+  });
+  S.pool.missing = [];
+  const hostWorker = startWorker(hostDir, PORT_POOL_HOST);
+  workers.push(hostWorker);
+  if (!(await waitPort(PORT_POOL_HOST, 120000))) {
+    throw new Error("wrangler dev (uji urutan pool skema lengkap) tidak siap pada port " + PORT_POOL_HOST + "\n" + hostWorker.getOut().slice(-1500));
+  }
+  results.push(await scenarioPoolOrderComplete(PORT_POOL_HOST));
+
+  // Worker kesebelas: `tunnel_host_ok` belum ada, `tunnel_ok` & `tls_ok` sudah -> urutan 2.
+  const hostMissingDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpn-smoke-order-host-missing-"));
+  workdirs.push(hostMissingDir);
+  makeFixture(hostMissingDir, {
+    DOH_ENDPOINT: "http://127.0.0.1:7303/dns-query",
+    FALLBACK_POOL: "on",
+    FALLBACK_POOL_URL: "http://127.0.0.1:7309",
+  });
+  S.pool.missing = ["tunnel_host_ok"];
+  const hostMissingWorker = startWorker(hostMissingDir, PORT_POOL_HOST_MISSING);
+  workers.push(hostMissingWorker);
+  if (!(await waitPort(PORT_POOL_HOST_MISSING, 120000))) {
+    throw new Error("wrangler dev (uji urutan pool tanpa tunnel_host_ok) tidak siap pada port " + PORT_POOL_HOST_MISSING + "\n" + hostMissingWorker.getOut().slice(-1500));
+  }
+  results.push(await scenarioPoolOrderHostMissing(PORT_POOL_HOST_MISSING));
+  S.pool.missing = ["tunnel_ok", "tls_ok", "tunnel_host_ok"];
 
   // Worker terpisah untuk pool dengan baris TERATAS mati (FALLBACK_TABLE sendiri). Isolate-nya
   // sendiri supaya cache pool kunci "all" di sini benar-benar bersih: daftar pertama yang

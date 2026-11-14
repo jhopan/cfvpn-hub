@@ -66,16 +66,27 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const POOL_CACHE_MAX = 8;
 const poolCache = new Map();
 const poolFetching = new Map();
-// Urutan pool: bukti EDGE dulu, baru bukti host scanner, baru ping tercepat.
-// `tunnel_ok` diisi cron CFVPN dari edge = vantage yang sama dengan tempat worker ini jalan,
-// jadi verdictnya paling relevan (true -> null/belum diprobe -> false). `tls_ok` diisi
-// panproxyscanner dari host scanner = bukti tunnel TLS 443 + verifikasi sertifikat; ia hanya
-// penentu untuk baris yang belum pernah diprobe edge, karena host scanner bisa tembus ke
-// proxy yang dari edge sudah mati. Proyeksi `select` tidak ikut berubah — kedua kolom itu
-// hanya dipakai untuk mengurutkan.
+// Urutan pool bertingkat sesuai sumber buktinya, dari yang paling relevan:
+//   `tunnel_ok`       = bukti EDGE: diisi cron CFVPN dari edge, vantage yang sama dengan tempat
+//                       worker ini jalan, jadi verdictnya paling relevan (true -> null/belum
+//                       diprobe -> false).
+//   `tls_ok`          = bukti HOST TLS: diisi panproxyscanner dari host scanner setelah tunnel
+//                       TLS 443 + verifikasi sertifikat berhasil. Hanya penentu untuk baris yang
+//                       belum pernah diprobe edge, karena host scanner bisa tembus ke proxy yang
+//                       dari edge sudah mati.
+//   `tunnel_host_ok`  = bukti TUNNEL dari HOST SCANNER (kolom baru, ditambahkan lewat SQL manual):
+//                       dipakai sebagai pembeda terakhir sebelum ping, yaitu saat scanner sudah
+//                       membuktikan tunnel hidup padahal edge belum punya verdict untuk baris itu.
+//   `ping`            = cadangan: baris tercepat yang masih segar, dipakai kalau tidak ada satu
+//                       pun bukti di atas yang tersedia.
+// Proyeksi `select` tidak ikut berubah — kolom-kolom itu hanya dipakai untuk mengurutkan.
 // Urutan pool dicoba berurutan sampai ada yang diterima PostgREST, karena kolom bukti
-// ditambahkan manual ke tabel: worker harus tahan pada skema yang belum lengkap.
+// ditambahkan manual ke tabel: worker harus tahan pada skema yang belum lengkap. Urutan yang
+// diterima diingat ~5 menit (poolOrderIndex), jadi penolakan tidak dibayar di setiap koneksi;
+// dan kalau semua urutan ditolak, pengambilan pool tetap gagal-terbuka seperti sebelumnya
+// (tidak pernah menggagalkan koneksi karena urutan saja).
 const POOL_ORDERS = [
+  "tunnel_ok.desc.nullslast,tls_ok.desc.nullslast,tunnel_host_ok.desc.nullslast,ping.asc.nullslast",
   "tunnel_ok.desc.nullslast,tls_ok.desc.nullslast,ping.asc.nullslast",
   "tunnel_ok.desc.nullslast,ping.asc.nullslast",
   "ping.asc.nullslast",
@@ -99,7 +110,7 @@ const ROTATE_POOL_LIMIT = 6; // pilih acak dari N proxy teratas (sudah urut ping
 
 // Versi template: muncul di /health supaya panel bisa memastikan worker mana yang sudah
 // memakai kode terbaru.
-const WORKER_VERSION = "2026-11-14a";
+const WORKER_VERSION = "2026-11-15a";
 
 // Log dibatasi per jenis pesan: hitungan tetap akurat (muncul di /health) tetapi Workers Logs
 // tidak dibanjiri ketika pool proxy sedang banyak yang mati.
@@ -1037,10 +1048,11 @@ async function pickRotateProxy(env, countries) {
   }
   if (!unique.length) return null;
   // Tercepat dulu: urutan kandidat datang dari server (tunnel_ok edge, lalu tls_ok host
-  // scanner, lalu ping), jadi kandidat pertama memang yang paling layak. Konsekuensinya beban
-  // menumpuk di proxy teratas; itu diterima karena yang dicari adalah koneksi paling cepat, dan
-  // kalau proxy itu ternyata gagal, jalur cadangan (`fallbackCandidates`: hedge + FALLBACK_MAX)
-  // tetap mencoba kandidat berikutnya dari daftar yang sama.
+  // scanner, lalu tunnel_host_ok dari host scanner, lalu ping), jadi kandidat pertama memang yang
+  // paling layak. Konsekuensinya beban menumpuk di proxy teratas; itu diterima karena yang dicari
+  // adalah koneksi paling cepat, dan kalau proxy itu ternyata gagal, jalur cadangan
+  // (`fallbackCandidates`: hedge + FALLBACK_MAX) tetap mencoba kandidat berikutnya dari daftar
+  // yang sama.
   return unique[0];
 }
 

@@ -4,12 +4,16 @@ import { isMissingColumnError, probeTunnel } from "./tunnel.js";
 
 // Batas kerja satu siklus. `ctx.waitUntil` hanya diberi ~30 detik setelah respons, jadi
 // jumlah baris dibatasi dan tiap koneksi punya timeout sendiri.
-const ROWS_PER_RUN = 60; // maksimum baris yang dicoba diprobe per siklus (digilir, bukan acak)
-const CONCURRENCY = 6;   // baris diperiksa paralel; tiap baris butuh koneksinya sendiri
-// ctx.waitUntil hanya diberi ~30 detik setelah respons terkirim. Deadline 18 s + satu baris
-// yang sedang berjalan (maks ~9 s) masih di dalam jatah itu; sebelumnya 25 s + 12 s membuat ekor
-// siklus dipotong platform sehingga hasil baris terakhir hilang (terlihat: /status.finishedAt null).
-const DEADLINE_MS = 18000;
+const ROWS_PER_RUN = 100; // maksimum baris yang dicoba diprobe per siklus (digilir, bukan acak)
+const CONCURRENCY = 10;   // baris diperiksa paralel; tiap baris butuh koneksinya sendiri
+// ctx.waitUntil hanya diberi ~30 detik setelah respons terkirim. 25 s aman karena dua hal:
+// lane tidak pernah memulai baris baru kalau sisa waktu < ROW_BUDGET_MS (9 s), jadi baris
+// terakhir mulai paling lambat pada detik ke-16; dan anggaran tiap baris di-clamp ke
+// `deadline - now`, jadi lane berhenti paling lambat di deadline (25 s), bukan 25 + 9 s.
+// Sisa ~5 s dari jatah platform menampung PATCH penutup. Kuncinya: anggaran per baris TIDAK
+// pernah melampaui deadline (lihat `budget` di processProxies), jadi ekor siklus tidak bisa
+// jadi deadline + ROW_BUDGET_MS — pola itulah yang dulu memotong siklus di platform.
+const DEADLINE_MS = 25000;
 const ROW_BUDGET_MS = 9000;
 const CHECK_TIMEOUT_MS = 5000;
 const TUNNEL_TIMEOUT_MS = 6000; // per koneksi: HTTP CONNECT dulu, lalu SOCKS5 kalau gagal
@@ -31,7 +35,7 @@ let lastRun = { startedAt: null, finishedAt: null, rows: 0, checked: 0, tunnel: 
 // connect() dari cloudflare:sockets bisa menggantung tanpa batas pada alamat yang di-blackhole
 // (tidak ada RST) dan socket.opened tidak mendukung abort. Probe punya timeout per tahap, tapi
 // semuanya menunggu socket.opened lebih dulu, jadi satu baris seperti itu menahan lane sampai
-// siklus dipotong platform (terukur: semua 6 lane stuck, checked=0). Bungkus: tutup soket kalau
+// siklus dipotong platform (terukur waktu itu: semua lane stuck, checked=0). Bungkus: tutup soket kalau
 // tidak terbuka tepat waktu, dan kembalikan objek dengan antarmuka socket yang sama supaya probe
 // tidak tahu bedanya.
 // Satu set soket per baris supaya penjaga anggaran bisa memutus semuanya sekaligus:
@@ -199,6 +203,10 @@ export default {
       // Anggaran: satu siklus hanya memuat ROWS_PER_RUN baris (digilir lewat urutan query),
       // menjalankannya CONCURRENCY sekaligus, dan berhenti saat DEADLINE_MS habis; sisanya
       // dilanjutkan siklus berikutnya tanpa baris yang kelaparan.
+      // Hitungan: 6 siklus/jam × 100 baris = 600 baris/jam (plafon). Pool ~300 baris aktif
+      // karena itu tersapu penuh tiap ~30 menit. Batas waktu per siklus: baris hanya dimulai
+      // selama sisa waktu ≥ ROW_BUDGET_MS, jadi dengan baris selambat 9 s pun satu siklus
+      // menyelesaikan 10 lane × 2 gelombang = 20 baris (≈120 baris/jam), bukan 0.
       const state = { tunnelColumns: true, warned: false };
       const deadline = Date.now() + DEADLINE_MS;
 

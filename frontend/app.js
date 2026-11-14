@@ -369,12 +369,38 @@ function renderNav() {
     if (proxyDelDead) proxyDelDead.onclick = async () => {
       if (!confirm("Hapus semua proxy mati?")) return;
       proxyDelDead.disabled = true;
+      proxyDelDead.textContent = "Menghapus...";
       try {
-        await supabase.from("proxy_pool").delete().eq("is_active", false);
+        // DELETE proxy_pool sekarang hanya lewat server: anon key tidak lagi punya izin hapus
+        // (sql/2026-11-15-pool-prune-service-key.sql). Server memverifikasi sesi (whoami) lalu
+        // menghapus dengan service key, jadi panel TIDAK boleh fallback ke supabase.from(...).
+        const res = await fetch("/api/pool-purge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: currentUser?.username || "", hash: currentUser?.hash || "" }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          // Pesan server sudah spesifik (service key belum diset, migrasi belum jalan, sesi
+          // tidak valid); fallback hanya untuk balasan tanpa error.
+          const fallback =
+            res.status === 401 ? "Sesi tidak valid. Login ulang dulu."
+            : res.status === 403 ? "Hanya admin yang boleh menghapus baris proxy."
+            : res.status === 409 ? "Migrasi SQL auth belum dijalankan di server."
+            : res.status === 503 ? "Fitur ini belum siap di server (service key belum diset)."
+            : res.status === 429 ? "Terlalu banyak permintaan. Coba lagi sebentar."
+            : "Gagal menghapus baris mati (HTTP " + res.status + ").";
+          setMessage("dbProxyMessage", data.error || fallback, true);
+          return;
+        }
         localStorage.removeItem("proxyListCache");
         location.reload();
-      } catch {}
-      proxyDelDead.disabled = false;
+      } catch (error) {
+        setMessage("dbProxyMessage", "Gagal menghubungi server: " + error.message, true);
+      } finally {
+        proxyDelDead.disabled = false;
+        proxyDelDead.textContent = "Hapus Mati";
+      }
     };
   }
 }
@@ -421,7 +447,7 @@ function renderDashboard() {
 // Versi template worker yang terpasang di frontend ini. Harus sama dengan WORKER_VERSION di
 // frontend/source/vpn-worker-*.js: /health mengembalikannya, jadi panel bisa menandai worker
 // yang masih versi lama dan menawarkan deploy ulang.
-const WORKER_TEMPLATE_VERSION = "2026-11-14a";
+const WORKER_TEMPLATE_VERSION = "2026-11-15a";
 
 // Cek versi tiap worker aktif lewat /health (CORS terbuka) dan tampilkan badge.
 async function checkWorkerVersions(workers) {
@@ -643,6 +669,11 @@ function proxyHealth(list, countries) {
   const host = usable.filter((p) => p.tunnel !== true && (p.hostTunnel === true || p.tls === true));
   const unproven = usable.filter((p) => p.tunnel !== true && !(p.hostTunnel === true || p.tls === true));
   const verifiedList = edge.concat(host);
+  // Urutan pilihan: tingkat bukti dulu (edge → host), lalu kecepatan di dalam tingkat itu.
+  // Baris host tetap ditawarkan sesudah edge supaya pool tidak habis saat edge tipis, dan
+  // hanya kalau dua-duanya kosong barulah baris segar yang belum diprobe (masih untung-untungan).
+  // `tunnel === false` sudah dibuang di `usable`, jadi tidak pernah muncul di sini.
+  const preferred = [...edge.slice().sort(proxySpeed), ...host.slice().sort(proxySpeed)];
   return {
     total: scope.length,
     fresh: fresh.length,
@@ -653,9 +684,7 @@ function proxyHealth(list, countries) {
     knownDead: fresh.filter((p) => p.tunnel === false).length,
     usable: usable.slice().sort(proxySpeed),
     verified: verifiedList.slice().sort(proxySpeed),
-    // Tawarkan tingkat bukti terbaik yang tersedia saja: edge dulu, lalu host, dan hanya kalau
-    // belum ada bukti apa pun barulah baris segar yang belum diprobe (masih untung-untungan).
-    preferred: (edge.length ? edge : host.length ? host : unproven).slice().sort(proxySpeed),
+    preferred: preferred.length ? preferred : unproven.slice().sort(proxySpeed),
   };
 }
 

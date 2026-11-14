@@ -3,4 +3,4 @@ main = "src/index.js"
 compatibility_date = "2024-03-01"
 
 [triggers]
-crons = ["*/15 * * * *"] # Cek setiap 15 menit
+crons = ["*/10 * * * *"] # Cek setiap 10 menit (ROWS_PER_RUN 100 => siklus penuh ~30 menit untuk pool ~300 baris)
